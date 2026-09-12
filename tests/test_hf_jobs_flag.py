@@ -151,6 +151,20 @@ def test_submitted_job_env_disarms_the_interception():
     )
 
 
+def test_submitted_job_env_selects_egl_for_headless_rendering():
+    """HF Jobs GPU containers have no display: --video's offscreen renderer
+    (mujoco.Renderer) hard-crashes with "an OpenGL platform library has not
+    been loaded" unless MUJOCO_GL=egl is set before mujoco picks a backend
+    (2026-09-12, first --video run on HF Jobs). Source-level like the
+    interception check above — a stripped or renamed key regresses silently
+    otherwise, same reasoning as MICRODUCK_IN_HF_JOB."""
+    src = (_ROOT / "src/mjlab_microduck/hf_jobs.py").read_text()
+    assert '"MUJOCO_GL": "egl"' in src, (
+        "submit() must put MUJOCO_GL=egl on the job's env, or any --video run "
+        "on HF Jobs crashes before the first iteration"
+    )
+
+
 # The load-bearing assumption, exercised through the real import paths: both
 # `from mjlab.scripts.train import main` (mjlab's shim) and our own shim must
 # reach the hook before mjlab parses argv. In a subprocess, because it ends in

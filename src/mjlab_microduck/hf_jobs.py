@@ -324,6 +324,15 @@ def submit(argv: list[str]) -> int:
         "MICRODUCK_IN_HF_JOB": "1",
         "CKPT_REPO": ckpt_repo,
         "TRAIN_ARGS": " ".join(shlex.quote(a) for a in [args.task, *train_args]),
+        # HF Jobs GPU containers have no display. mjlab's train.py already sets
+        # MUJOCO_EGL_DEVICE_ID (targets the right GPU for EGL) but never
+        # selects EGL as the backend, so --video's offscreen renderer falls
+        # back to GLX/X11 and mujoco.Renderer() hard-crashes with
+        # "an OpenGL platform library has not been loaded" — hit 2026-09-12,
+        # first time anything on this repo ran --video via --hf-jobs. Setting
+        # this here (container env, before the job's Python even starts) is
+        # the fix; it's a no-op for non-video runs, so left unconditional.
+        "MUJOCO_GL": "egl",
     }
     secrets: dict[str, str] = {"HF_TOKEN": token}
 
