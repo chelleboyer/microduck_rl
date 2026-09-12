@@ -41,6 +41,8 @@ def test_hop_reward_signs():
     assert r["hop_height_after_landing"].weight > 0
     assert r["hop_unweighting"].weight > 0
     assert r["hop_forward_progress"].weight > 0
+    # ordinary cost (returns >= 0), ramped from 0 by curriculum -> NEGATIVE weight
+    assert r["hop_no_crawl"].weight <= 0
 
 
 def test_hop_gate_params_consistent():
@@ -112,6 +114,23 @@ def test_hop_trunk_ground_sensor_registered():
     # (which would make this indistinguishable from feet_ground_contact).
     assert trunk_sensor.primary.mode == "body"
     assert trunk_sensor.primary.pattern == "trunk_base"
+
+
+def test_hop_no_crawl_ramps_in_after_torque_and_landing_polish():
+    """Anti-worm tax must ramp in strictly later than the other curriculum
+    polish terms — a no-armed robot needs its trunk-drag recovery option
+    free until some landing strategy has already been found, or it may
+    never discover how to get up from a bad landing at all."""
+    cfg = make_microduck_hop_env_cfg()
+    no_crawl_stages = cfg.curriculum["no_crawl_weight"].params["weight_stages"]
+    torque_stages = cfg.curriculum["torque_rate_weight"].params["weight_stages"]
+    assert no_crawl_stages[0]["weight"] == 0.0
+    first_nonzero_step = next(s["step"] for s in no_crawl_stages if s["weight"] != 0.0)
+    last_torque_step = torque_stages[-1]["step"]
+    assert first_nonzero_step > last_torque_step
+    # every non-initial stage must be negative (ordinary cost -> negative weight)
+    for stage in no_crawl_stages[1:]:
+        assert stage["weight"] < 0
 
 
 def test_hop_rough_variant_not_offered():

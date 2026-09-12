@@ -7646,3 +7646,53 @@ def hop_stand_tax(
     )
     shortfall = torch.clamp(target_height - z, min=0.0)
     return -shortfall * _hop_completion_gate(env, min_air_time)
+
+
+def hop_no_crawl_penalty(
+    env: ManagerBasedRlEnv,
+    sensor_name: str = "trunk_ground_contact",
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Cost: horizontal trunk speed WHILE the trunk is touching the ground.
+
+    Closes a SECOND exploit found by video review (2026-09-12, "worming"),
+    distinct from the butt-bounce the trunk-taint gate above already
+    closes. standing_composite_score is multiplicative (height × upright ×
+    pose) specifically to prevent a compromise pose from farming partial
+    credit AT A SINGLE INSTANT — but nothing requires the policy to ever
+    STOP MOVING once _hop_completion_gate is open. A policy that drags or
+    undulates its trunk along the ground, rhythmically sweeping close to
+    the target height/upright/pose over and over, can farm nearly as much
+    reward as one that genuinely settles into standing — and ground contact
+    may make that easier to discover than free-standing balance, since it
+    adds stability balance doesn't have. roulade_landing_composite uses the
+    identical standing_composite_score × gate pattern with no equivalent
+    guard, so this was a latent gap there too, not something already solved
+    elsewhere in this file.
+
+    Deliberately does NOT penalize touching the ground at all — the robot
+    has no arms (AGENTS.md joint layout), so briefly bracing or rocking on
+    the trunk to get upright after a bad landing is a legitimate part of
+    "landing badly and recovering" (the same allowance roulade makes for
+    its own recovery phase). Only HORIZONTAL trunk velocity while that
+    contact is happening is taxed — the specific mechanical signature of
+    using ground friction to crawl, not merely touching down. Applies
+    across the whole episode (not gated on _hop_completion_gate): a
+    trunk-drag before liftoff is just as undesirable as one after landing.
+
+    Returns ≥ 0 (ordinary cost, unlike the self-negating *_tax functions
+    above) — use a NEGATIVE weight. UNVERIFIED like the rest of this file's
+    constants: no GPU in the sandbox that wrote this to measure a real
+    worm's trunk speed, so the weight schedule is a guess, ramped in via
+    curriculum (same reasoning as gentle_landing/torque_rate: an attempt-tax
+    active during discovery risks blocking recovery entirely for a
+    no-armed robot, so it only firms up once SOME landing strategy exists).
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    if sensor_name not in env.scene.sensors:
+        return torch.zeros(env.num_envs, device=env.device)
+    found = env.scene.sensors[sensor_name].data.found
+    touching = torch.nan_to_num(found, nan=0.0).reshape(found.shape[0], -1).any(dim=-1).float()
+    horiz_vel = torch.nan_to_num(asset.data.root_link_lin_vel_w[:, :2], nan=0.0)
+    speed = torch.linalg.norm(horiz_vel, dim=-1)
+    return speed * touching

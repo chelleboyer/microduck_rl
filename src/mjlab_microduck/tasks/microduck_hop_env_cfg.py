@@ -24,6 +24,18 @@ unweighting credit is possible — see that function's docstring for why
 this can't penalize a genuine landing-and-recovery phase, only a
 trunk-assisted liftoff.
 
+Course correction 2 (same day, run-2): fixing the butt-bounce revealed a
+SECOND exploit rather than a clean hop — "worming", where the policy
+drags/undulates its trunk along the ground to sweep repeatedly close to
+the standing target instead of settling into it once. hop_no_crawl (mdp.
+hop_no_crawl_penalty) closes this by taxing horizontal trunk velocity
+while the trunk is in ground contact, without penalizing the contact
+itself (the robot has no arms — bracing/rocking on the trunk is a
+legitimate way to get upright after a bad landing). Ramped in via
+curriculum, held back further than the other polish terms specifically
+because blocking a no-armed robot's only recovery option too early could
+prevent it from ever discovering how to get up at all.
+
 Product requirements: ../../../docs/ideas/hop-behavior.md in the `microduck`
 repo. This file is the training-side implementation of that PRD; nothing in
 that document should be read as a training-time decision, and nothing here
@@ -288,6 +300,16 @@ def make_microduck_hop_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         func=microduck_mdp.trunk_vertical_accel_penalty,
         weight=0.0,
         params={"asset_cfg": SceneEntityCfg("robot", body_names=("trunk_base",))},
+    )
+
+    # Closes the worming exploit (see mdp.hop_no_crawl_penalty docstring):
+    # ordinary cost (returns >= 0) -> NEGATIVE weight. Introduced at 0,
+    # ramped by curriculum — same reasoning as gentle_landing above, but
+    # more cautious here: the robot has no arms, so an attempt-tax active
+    # too early could block the only recovery method a fallen robot has.
+    cfg.rewards["hop_no_crawl"] = RewardTermCfg(
+        func=microduck_mdp.hop_no_crawl_penalty,
+        weight=0.0,
     )
 
     cfg.rewards["self_collisions"] = RewardTermCfg(
@@ -580,6 +602,23 @@ def make_microduck_hop_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
                 {"step": 0,          "weight": 0.0},
                 {"step": 1500 * 24,  "weight": 0.002},
                 {"step": 2500 * 24,  "weight": 0.005},
+            ],
+        },
+    )
+    # Anti-worm polish — same "introduced only after a landing strategy
+    # exists" reasoning as the two curricula above, held back one stage
+    # further: with no arms, a robot that hasn't yet found ANY way to get
+    # upright from a bad landing needs its trunk-drag option free, or it
+    # may never discover recovery at all. Ramps in only once the standard
+    # 2500*24 stage (torque/impact polish) has already landed.
+    cfg.curriculum["no_crawl_weight"] = CurriculumTermCfg(
+        func=microduck_mdp.reward_weight,
+        params={
+            "reward_name":   "hop_no_crawl",
+            "weight_stages": [
+                {"step": 0,          "weight": 0.0},
+                {"step": 3000 * 24,  "weight": -0.5},
+                {"step": 4000 * 24,  "weight": -1.5},
             ],
         },
     )
