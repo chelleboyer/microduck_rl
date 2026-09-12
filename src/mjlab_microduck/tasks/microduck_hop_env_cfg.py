@@ -12,6 +12,18 @@ superseding that draft) — hop_forward_progress below is the training-side
 answer. Landing on two feet stays the v1 target; one-foot landing is an
 explicitly later step, not attempted here.
 
+Course correction 2026-09-12 (mid-run-1): the first forward-hop run's
+dominant strategy at ~1300/6000 iterations was a butt-bounce — trunk hits
+the ground, rebounds, both feet come off for a moment, some of that
+rebound happens to carry the robot forward. Every reward term up to that
+point only checked the FEET, so this satisfied every gate as well as a
+real leg-driven hop would have. trunk_ground_cfg + the taint mechanism in
+mdp.py (_update_hop_trunk_taint) close it: once the trunk has touched the
+ground this episode, no further hop-air-time, forward-distance, or
+unweighting credit is possible — see that function's docstring for why
+this can't penalize a genuine landing-and-recovery phase, only a
+trunk-assisted liftoff.
+
 Product requirements: ../../../docs/ideas/hop-behavior.md in the `microduck`
 repo. This file is the training-side implementation of that PRD; nothing in
 that document should be read as a training-time decision, and nothing here
@@ -159,13 +171,28 @@ def make_microduck_hop_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         num_slots=1,
     )
 
+    # Closes the butt-bounce exploit (see mdp.hop_forward_progress module
+    # docstring / _update_hop_trunk_taint): mode="body" (not "subtree",
+    # unlike self_collision_cfg above) restricts this to geoms owned
+    # directly by the trunk_base body — the torso shell itself, not the legs
+    # or head hanging off it — against the terrain. Any hit here means the
+    # push-off wasn't leg-driven.
+    trunk_ground_cfg = ContactSensorCfg(
+        name="trunk_ground_contact",
+        primary=ContactMatch(mode="body", pattern="trunk_base", entity="robot"),
+        secondary=ContactMatch(mode="body", pattern="terrain"),
+        fields=("found",),
+        reduce="none",
+        num_slots=1,
+    )
+
     foot_frictions_geom_names = ("left_foot_collision", "right_foot_collision")
 
     # ── Base config ───────────────────────────────────────────────────────────
     cfg = make_velocity_env_cfg()
 
     cfg.scene.entities = {"robot": MICRODUCK_STANDUP_ROBOT_CFG}
-    cfg.scene.sensors  = (feet_ground_cfg, self_collision_cfg)
+    cfg.scene.sensors  = (feet_ground_cfg, self_collision_cfg, trunk_ground_cfg)
     cfg.viewer.body_name = "trunk_base"
 
     cfg.episode_length_s = EPISODE_LENGTH_S

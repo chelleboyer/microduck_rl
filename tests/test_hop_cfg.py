@@ -99,6 +99,21 @@ def test_hop_midair_spawn_carries_forward_momentum():
     assert MIDAIR_VX_RANGE[1] > 0.0
 
 
+def test_hop_trunk_ground_sensor_registered():
+    """Closes the butt-bounce exploit (2026-09-12): without this sensor,
+    nothing distinguishes a leg-driven liftoff from a trunk-to-ground
+    push-off, and both satisfy the feet-only air-time gate equally."""
+    cfg = make_microduck_hop_env_cfg()
+    sensor_names = {s.name for s in cfg.scene.sensors}
+    assert "trunk_ground_contact" in sensor_names
+    trunk_sensor = next(s for s in cfg.scene.sensors if s.name == "trunk_ground_contact")
+    # mode="body", not "subtree" (unlike self_collision_cfg) — must restrict
+    # to the trunk_base body's own geoms, not expand to the whole robot
+    # (which would make this indistinguishable from feet_ground_contact).
+    assert trunk_sensor.primary.mode == "body"
+    assert trunk_sensor.primary.pattern == "trunk_base"
+
+
 def test_hop_rough_variant_not_offered():
     """No Rough task id is registered for hop yet (flat only, unlike
     roulade's siblings) -- this test documents that scope choice."""

@@ -7244,7 +7244,35 @@ def _hop_state(env: ManagerBasedRlEnv) -> tuple:
         env._hop_max_forward_dist = z.clone()
         env._hop_fwd_paid = z.clone()
         env._hop_last_fwd_update_step = -1
+        env._hop_trunk_touched_ground = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
     return env._hop_max_air_time, env._hop_paid, env._hop_completed
+
+
+def _update_hop_trunk_taint(env: ManagerBasedRlEnv, sensor_name: str = "trunk_ground_contact") -> None:
+    """Sticky per-episode flag: has the trunk touched the ground THIS episode.
+
+    Closes a real exploit found in training on 2026-09-12: nothing checked
+    what the TRUNK was doing during liftoff, only the feet, so the policy's
+    dominant strategy became a butt-bounce — trunk-to-ground push-off — which
+    satisfies "both feet off the ground" just as well as a real leg-driven
+    hop does. Once tripped, this flag never clears (matches
+    _hop_completion_gate's own "stays open for the rest of the episode"
+    reasoning) — it only ever PREVENTS further credit
+    (_update_hop_accum / _update_hop_forward_accum mask their frontier
+    updates by it), never revokes credit already banked, so it cannot
+    penalize a genuine hop's landing-and-recovery phase (which is allowed to
+    touch the ground, same as roulade) — only a trunk-ground touch BEFORE
+    real liftoff is ever earned.
+
+    Idempotent and safe to call from multiple reward terms in the same
+    step — unlike the frontier updates, OR-ing an already-true (or
+    unchanged) value needs no step-guard.
+    """
+    _hop_state(env)
+    if sensor_name in env.scene.sensors:
+        found = env.scene.sensors[sensor_name].data.found
+        touched_now = torch.nan_to_num(found, nan=0.0).reshape(found.shape[0], -1).any(dim=-1).bool()
+        env._hop_trunk_touched_ground = env._hop_trunk_touched_ground | touched_now
 
 
 def _hop_forward_state(env: ManagerBasedRlEnv) -> tuple:
@@ -7263,12 +7291,20 @@ def _update_hop_accum(env: ManagerBasedRlEnv, sensor_name: str = "feet_ground_co
     Step-guarded like _update_roulade_accum so multiple reward terms reading
     the frontier in the same control step don't double-count. The frontier
     only moves forward (max-so-far); landing and re-jumping doesn't erase it.
+
+    TAINT-MASKED (see _update_hop_trunk_taint): a step where the trunk has
+    ever touched the ground this episode contributes zero to the frontier.
+    This is the single choke point every hop reward routes through (directly
+    or via _hop_completion_gate), so masking here closes the butt-bounce
+    exploit everywhere at once rather than patching each reward term.
     """
     _hop_state(env)
+    _update_hop_trunk_taint(env)
     step = int(env.common_step_counter)
     if step != env._hop_last_update_step:
         air_time = foot_air_time_safe(env, sensor_name)  # (B, 2): left, right
         both_air = torch.min(air_time[:, 0], air_time[:, 1])
+        both_air = torch.where(env._hop_trunk_touched_ground, torch.zeros_like(both_air), both_air)
         env._hop_max_air_time = torch.maximum(env._hop_max_air_time, both_air)
         env._hop_last_update_step = step
 
@@ -7408,6 +7444,7 @@ def reset_hop_state(
     max_air[env_ids] = seeded
     paid[env_ids] = seeded
     completed[env_ids] = is_mid
+    env._hop_trunk_touched_ground[env_ids] = False
 
 
 def hop_unweighting_bonus(
@@ -7428,12 +7465,16 @@ def hop_unweighting_bonus(
     asset: Entity = env.scene[asset_cfg.name]
     if sensor_name not in env.scene.sensors:
         return torch.zeros(env.num_envs, device=env.device)
+    _update_hop_trunk_taint(env)
     force = env.scene.sensors[sensor_name].data.force
     force_mag = torch.nan_to_num(force, nan=0.0).norm(dim=-1)
     total_force = force_mag.view(force_mag.shape[0], -1).sum(dim=-1)
     unweighted = torch.clamp(1.0 - total_force / max(force_norm, 1e-6), min=0.0, max=1.0)
     vz = torch.nan_to_num(asset.data.root_link_lin_vel_w[:, 2], nan=0.0)
-    return torch.clamp(vz, min=0.0) * unweighted
+    bonus = torch.clamp(vz, min=0.0) * unweighted
+    # Taint-masked too: a butt-bounce's rising CoM velocity while its feet
+    # happen to unweight must not earn the discovery-precursor bonus either.
+    return torch.where(env._hop_trunk_touched_ground, torch.zeros_like(bonus), bonus)
 
 
 def hop_air_time_progress(
@@ -7475,6 +7516,7 @@ def _update_hop_forward_accum(env: ManagerBasedRlEnv, sensor_name: str = "feet_g
     distance already earned this episode.
     """
     launch_xy, launch_heading, max_fwd, _ = _hop_forward_state(env)
+    _update_hop_trunk_taint(env)
     step = int(env.common_step_counter)
     if step != env._hop_last_fwd_update_step:
         if sensor_name in env.scene.sensors:
@@ -7483,6 +7525,9 @@ def _update_hop_forward_accum(env: ManagerBasedRlEnv, sensor_name: str = "feet_g
             both_air = ~(found[:, 0].bool()) & ~(found[:, 1].bool())
         else:
             both_air = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+        # Taint-masked, same reasoning as _update_hop_accum: a butt-bounce's
+        # airborne moments must not earn forward-distance credit either.
+        both_air = both_air & ~env._hop_trunk_touched_ground
         asset: Entity = env.scene["robot"]
         cur_xy = torch.nan_to_num(asset.data.root_link_pos_w[:, :2], nan=0.0)
         disp = cur_xy - launch_xy
