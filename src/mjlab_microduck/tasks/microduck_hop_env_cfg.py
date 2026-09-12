@@ -1,9 +1,16 @@
 """Microduck hop task — attempt 1, run 1.
 
 Episodic policy: robot starts standing, both feet leave the ground at the
-same instant, and it lands upright and recovers to standing. Triggered at
-deployment like sit/standup/roulade (policy switch = hop starts immediately;
-no phase clock, no reference motion).
+same instant, travels FORWARD during the airborne phase, and lands upright
+and recovers to standing. Triggered at deployment like sit/standup/roulade
+(policy switch = hop starts immediately; no phase clock, no reference
+motion).
+
+Scope note: the product direction is a forward hop, not the in-place hop the
+PRD's v1 non-goals describe (a real-time call from the project owner,
+superseding that draft) — hop_forward_progress below is the training-side
+answer. Landing on two feet stays the v1 target; one-foot landing is an
+explicitly later step, not attempted here.
 
 Product requirements: ../../../docs/ideas/hop-behavior.md in the `microduck`
 repo. This file is the training-side implementation of that PRD; nothing in
@@ -83,14 +90,20 @@ EPISODE_LENGTH_S = 3.0
 STAND_Z = 0.115
 
 # ── Hop targets (UNVERIFIED — see file header) ───────────────────────────────
-TARGET_AIR_TIME   = 0.15   # s of simultaneous air time that earns full progress credit
-HOP_MIN_AIR_TIME  = 0.06   # s that opens the landing/recovery gate
-UNWEIGHT_FORCE_N  = 8.0    # ≈ body weight in Newtons; recompute as mass*9.81 once measured
+TARGET_AIR_TIME    = 0.15   # s of simultaneous air time that earns full progress credit
+HOP_MIN_AIR_TIME   = 0.06   # s that opens the landing/recovery gate
+UNWEIGHT_FORCE_N   = 8.0    # ≈ body weight in Newtons; recompute as mass*9.81 once measured
+TARGET_FORWARD_DIST = 0.08  # m of airborne forward travel that earns full progress credit —
+                             # a guess for a 25 cm robot's standing broad-hop, not a measurement
 
 # ── Mid-air spawn (reverse curriculum) ───────────────────────────────────────
 MIDAIR_Z_MIN  = 0.14
 MIDAIR_Z_MAX  = 0.18
 MIDAIR_VZ_RANGE = (-1.5, -0.5)   # falling, UNVERIFIED — measure a real hop's descent speed
+MIDAIR_VX_RANGE = (0.0, 0.6)     # forward speed at landing, UNVERIFIED — a forward hop lands
+                                  # with real horizontal momentum; without this the
+                                  # landing/recovery half of the reverse curriculum only ever
+                                  # practices a dead-stop landing and won't transfer
 
 _LEG_JOINTS = [0, 1, 2, 3, 4, 9, 10, 11, 12, 13]
 
@@ -192,6 +205,16 @@ def make_microduck_hop_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         func=microduck_mdp.hop_air_time_progress,
         weight=6.0,
         params={"target_air_time": TARGET_AIR_TIME, "max_paid_rate": 1.0},
+    )
+
+    # The forward-hop objective. Gated the same way hop_air_time is (genuine
+    # simultaneous double-foot flight, this instant) — see
+    # mdp.hop_forward_progress / _update_hop_forward_accum docstrings for why
+    # a shuffle or walk-forward cannot farm this.
+    cfg.rewards["hop_forward_progress"] = RewardTermCfg(
+        func=microduck_mdp.hop_forward_progress,
+        weight=5.0,
+        params={"target_distance": TARGET_FORWARD_DIST, "max_paid_rate": 1.0},
     )
 
     # Completion-gated standing annuity — the dominant attractor, mirroring
@@ -367,6 +390,7 @@ def make_microduck_hop_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
             "midair_z_min":      MIDAIR_Z_MIN,
             "midair_z_max":      MIDAIR_Z_MAX,
             "midair_vz_range":   MIDAIR_VZ_RANGE,
+            "midair_vx_range":   MIDAIR_VX_RANGE,
             "joint_noise_std":   0.08,
             "gate_min_air_time": HOP_MIN_AIR_TIME,
         },

@@ -7219,6 +7219,17 @@ def roulade_lateral_velocity_penalty(
 # because roulade's choice was justified by roulade being empirically easy to
 # discover — unknown here. Revisit once a run shows whether liftoff is easy
 # or hard to find.
+#
+# Scope update (still attempt 1, no real run yet): the product direction is a
+# FORWARD hop, not in-place — hop_forward_progress below adds that. It is
+# deliberately gated on the same hard state condition as hop_air_time_progress
+# (both feet simultaneously off the ground THIS INSTANT, from the contact
+# sensor's `found` field, not merely "happened at some point this episode"):
+# a shuffle or walk-forward never satisfies "both feet off at once
+# continuously across the step", so it earns zero here structurally, not via
+# a penalty nudge (AGENTS.md: encode what counts as the maneuver in a gate).
+# Forward distance is measured along the heading recorded at launch
+# (reset_hop_state), not world +x, because spawn yaw is randomized.
 
 
 def _hop_state(env: ManagerBasedRlEnv) -> tuple:
@@ -7228,7 +7239,22 @@ def _hop_state(env: ManagerBasedRlEnv) -> tuple:
         env._hop_paid = z.clone()
         env._hop_completed = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
         env._hop_last_update_step = -1
+        env._hop_launch_xy = torch.zeros(env.num_envs, 2, device=env.device)
+        env._hop_launch_heading = torch.zeros(env.num_envs, 2, device=env.device)
+        env._hop_max_forward_dist = z.clone()
+        env._hop_fwd_paid = z.clone()
+        env._hop_last_fwd_update_step = -1
     return env._hop_max_air_time, env._hop_paid, env._hop_completed
+
+
+def _hop_forward_state(env: ManagerBasedRlEnv) -> tuple:
+    _hop_state(env)  # shares the same lazy-init block
+    return (
+        env._hop_launch_xy,
+        env._hop_launch_heading,
+        env._hop_max_forward_dist,
+        env._hop_fwd_paid,
+    )
 
 
 def _update_hop_accum(env: ManagerBasedRlEnv, sensor_name: str = "feet_ground_contact") -> None:
@@ -7272,6 +7298,7 @@ def reset_hop_state(
     midair_z_min: float = 0.14,
     midair_z_max: float = 0.18,
     midair_vz_range: tuple = (-1.5, -0.5),
+    midair_vx_range: tuple = (0.0, 0.0),
     tuck_overrides: Optional[dict] = None,
     tuck_factor_range: tuple = (0.0, 0.5),
     joint_noise_std: float = 0.0,
@@ -7287,7 +7314,11 @@ def reset_hop_state(
     velocity and the air-time frontier PRE-SEEDED past gate_min_air_time, so
     the landing/recovery gate is open from step 0 of the episode. This
     trains "land upright and recover" directly, without requiring liftoff to
-    already work.
+    already work. ``midair_vx_range`` samples forward speed (along the
+    spawn heading) at spawn too, default off (0,0) — a FORWARD hop lands
+    with real horizontal momentum, so the reverse curriculum must practice
+    recovery under that momentum or it solves an easier problem (landing
+    dead-stopped) that doesn't transfer to the real hop.
     """
     if env_ids is None or len(env_ids) == 0:
         return
@@ -7302,6 +7333,7 @@ def reset_hop_state(
     yaw = torch.rand(num, device=env.device) * 2 * np.pi - np.pi
     cy = torch.cos(yaw * 0.5)
     sy = torch.sin(yaw * 0.5)
+    heading = torch.stack([torch.cos(yaw), torch.sin(yaw)], dim=1)  # forward unit vector, world xy
 
     pitch = (torch.rand(num, device=env.device) * 2 - 1) * standing_tilt_max
     roll = (torch.rand(num, device=env.device) * 2 - 1) * max(standing_tilt_max, math.radians(3.0))
@@ -7317,6 +7349,17 @@ def reset_hop_state(
     z_mid = torch.rand(num, device=env.device) * (midair_z_max - midair_z_min) + midair_z_min
     new_z = torch.where(is_mid, z_mid, z_stand)
 
+    # Launch reference for hop_forward_progress: position now (post whatever
+    # default reset already placed it at) and heading just sampled above.
+    # Set for ALL env_ids uniformly — harmless for the mid-air bucket, which
+    # doesn't earn forward-progress credit anyway (no real liftoff to measure
+    # a launch point from).
+    _hop_state(env)
+    env._hop_launch_xy[env_ids] = env.sim.data.qpos[env_ids, 0:2].clone()
+    env._hop_launch_heading[env_ids] = heading
+    env._hop_max_forward_dist[env_ids] = 0.0
+    env._hop_fwd_paid[env_ids] = 0.0
+
     env.sim.data.qpos[env_ids, 2] = new_z
     env.sim.data.qpos[env_ids, 3:7] = quat
     env.sim.data.qvel[env_ids, :6] = 0.0
@@ -7329,6 +7372,16 @@ def reset_hop_state(
             + midair_vz_range[0]
         )
         env.sim.data.qvel[mid_env_ids, 2] = vz
+
+        if midair_vx_range != (0.0, 0.0):
+            speed = (
+                torch.rand(len(mid_env_ids), device=env.device)
+                * (midair_vx_range[1] - midair_vx_range[0])
+                + midair_vx_range[0]
+            )
+            heading_mid = heading[is_mid]
+            env.sim.data.qvel[mid_env_ids, 0] = heading_mid[:, 0] * speed
+            env.sim.data.qvel[mid_env_ids, 1] = heading_mid[:, 1] * speed
 
         servo_ids = _servo_joint_ids(env, asset)
         if tuck_overrides:
@@ -7404,6 +7457,66 @@ def hop_air_time_progress(
     delta = torch.clamp(delta, max=max_paid_rate * env.step_dt)
     env._hop_paid = torch.maximum(paid, new_paid)
     return delta / (env.step_dt * target_air_time)
+
+
+def _update_hop_forward_accum(env: ManagerBasedRlEnv, sensor_name: str = "feet_ground_contact") -> None:
+    """Track the per-episode frontier of forward displacement WHILE airborne.
+
+    Unlike _update_hop_accum (which tracks a DURATION so a single frame of
+    noise doesn't count), this one gates on the INSTANTANEOUS contact state
+    every step: both feet's `found` must read False THIS STEP for that
+    step's displacement to be eligible at all. A shuffle or a walk cycle —
+    which never has both feet off at once — contributes zero on every step,
+    so its frontier never moves, by construction, regardless of how far it
+    travels. Displacement is projected onto the heading recorded at launch
+    (reset_hop_state), since spawn yaw is randomized and this must be
+    "forward relative to the robot", not world +x. The frontier is a
+    max-so-far, like the air-time one: landing and stopping doesn't erase
+    distance already earned this episode.
+    """
+    launch_xy, launch_heading, max_fwd, _ = _hop_forward_state(env)
+    step = int(env.common_step_counter)
+    if step != env._hop_last_fwd_update_step:
+        if sensor_name in env.scene.sensors:
+            found = env.scene.sensors[sensor_name].data.found
+            found = found.reshape(found.shape[0], -1)[:, :2]
+            both_air = ~(found[:, 0].bool()) & ~(found[:, 1].bool())
+        else:
+            both_air = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+        asset: Entity = env.scene["robot"]
+        cur_xy = torch.nan_to_num(asset.data.root_link_pos_w[:, :2], nan=0.0)
+        disp = cur_xy - launch_xy
+        forward_disp = torch.clamp((disp * launch_heading).sum(dim=-1), min=0.0)
+        forward_disp = torch.where(both_air, forward_disp, torch.zeros_like(forward_disp))
+        env._hop_max_forward_dist = torch.maximum(max_fwd, forward_disp)
+        env._hop_last_fwd_update_step = step
+
+
+def hop_forward_progress(
+    env: ManagerBasedRlEnv,
+    target_distance: float = 0.08,
+    max_paid_rate: float = 1.0,
+    sensor_name: str = "feet_ground_contact",
+) -> torch.Tensor:
+    """Pay increments of the airborne-forward-displacement frontier, up to a target.
+
+    Same shape as hop_air_time_progress: reward = Δ(min(frontier, target)) /
+    (step_dt · target), capped at max_paid_rate. Gated structurally on
+    genuine simultaneous double-foot flight (see
+    _update_hop_forward_accum) — this is what makes "hop forward" mean
+    something different from "walk forward then stand still": the latter
+    earns nothing here no matter how far it travels. target_distance is
+    UNVERIFIED (see file header): measure a controlled push-off's actual
+    forward reach in sim before trusting it — this is a guess for a 25 cm,
+    800 g robot's standing broad-hop, not a measurement.
+    """
+    _update_hop_forward_accum(env, sensor_name)
+    _, _, max_fwd, paid = _hop_forward_state(env)
+    new_paid = torch.clamp(max_fwd, max=target_distance)
+    delta = torch.clamp(new_paid - torch.clamp(paid, max=target_distance), min=0.0)
+    delta = torch.clamp(delta, max=max_paid_rate * env.step_dt)
+    env._hop_fwd_paid = torch.maximum(paid, new_paid)
+    return delta / (env.step_dt * target_distance)
 
 
 def hop_landing_composite(

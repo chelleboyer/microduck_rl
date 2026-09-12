@@ -2,8 +2,10 @@ import math
 
 from mjlab_microduck.tasks.microduck_hop_env_cfg import (
     HOP_MIN_AIR_TIME,
+    MIDAIR_VX_RANGE,
     STAND_Z,
     TARGET_AIR_TIME,
+    TARGET_FORWARD_DIST,
     make_microduck_hop_env_cfg,
 )
 
@@ -13,6 +15,7 @@ def test_hop_cfg_builds():
     assert "hop_air_time" in cfg.rewards
     assert "hop_landing_composite" in cfg.rewards
     assert "hop_unweighting" in cfg.rewards
+    assert "hop_forward_progress" in cfg.rewards
 
 
 def test_hop_cfg_play_variant_builds():
@@ -37,6 +40,7 @@ def test_hop_reward_signs():
     assert r["hop_upright_after_landing"].weight > 0
     assert r["hop_height_after_landing"].weight > 0
     assert r["hop_unweighting"].weight > 0
+    assert r["hop_forward_progress"].weight > 0
 
 
 def test_hop_gate_params_consistent():
@@ -78,6 +82,21 @@ def test_hop_spawn_mix_curriculum_never_zeroes_midair():
     stages = cfg.curriculum["hop_spawn_mix"].params["param_stages"]
     for stage in stages:
         assert stage["params"]["midair_prob"] > 0.0
+
+
+def test_hop_forward_target_positive_and_gate_params_consistent():
+    cfg = make_microduck_hop_env_cfg()
+    assert TARGET_FORWARD_DIST > 0.0
+    assert cfg.rewards["hop_forward_progress"].params["target_distance"] == TARGET_FORWARD_DIST
+
+
+def test_hop_midair_spawn_carries_forward_momentum():
+    """Reverse-curriculum landings must practice recovering under forward
+    speed, not a dead stop, or the trained recovery won't match a real
+    forward hop's landing (see midair_vx_range docstring in mdp.py)."""
+    cfg = make_microduck_hop_env_cfg()
+    assert cfg.events["set_hop_state"].params["midair_vx_range"] == MIDAIR_VX_RANGE
+    assert MIDAIR_VX_RANGE[1] > 0.0
 
 
 def test_hop_rough_variant_not_offered():
