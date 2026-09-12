@@ -337,13 +337,14 @@ def submit(argv: list[str]) -> int:
         # first time anything on this repo ran --video via --hf-jobs. Setting
         # this here (container env, before the job's Python even starts) is
         # the fix; it's a no-op for non-video runs, so left unconditional.
+        # NOTE: NVIDIA_DRIVER_CAPABILITIES is NOT settable here — HF Jobs
+        # rejects it as a reserved env var (confirmed 2026-09-12, "Bad
+        # Request: Reserved environment variable ... cannot be set"). If the
+        # GPU's EGL vendor ICD still isn't mounted once libegl1 is present
+        # (BOOTSTRAP, below), that capability is on the platform to fix, not
+        # us — the crash signature differs (an EGL runtime error, not
+        # PyOpenGL's import-time "'NoneType' object has no attribute").
         "MUJOCO_GL": "egl",
-        # The NVIDIA container runtime only mounts the GPU's EGL vendor ICD
-        # (the actual hardware backend behind libEGL) when "graphics" is in
-        # this list — the base image's default omits it (compute-only).
-        # Without the ICD, libEGL loads (once libegl1 is installed, above)
-        # but eglGetDisplay/eglInitialize have nothing to bind to.
-        "NVIDIA_DRIVER_CAPABILITIES": "all",
     }
     secrets: dict[str, str] = {"HF_TOKEN": token}
 

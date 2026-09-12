@@ -165,17 +165,21 @@ def test_submitted_job_env_selects_egl_for_headless_rendering():
     )
 
 
-def test_bootstrap_installs_libegl_and_requests_graphics_capability():
-    """MUJOCO_GL=egl alone isn't enough on this image (2026-09-12):
-    - the pytorch/pytorch runtime image ships no libEGL.so.1 at all (import
-      crash: PyOpenGL's eglQueryString is None) until libegl1 is apt-installed;
-    - and even with libEGL present, NVIDIA's container runtime only mounts the
-      GPU's EGL vendor ICD when "graphics" is requested via
-      NVIDIA_DRIVER_CAPABILITIES (the base image defaults to compute-only)."""
+def test_bootstrap_installs_libegl():
+    """MUJOCO_GL=egl alone isn't enough on this image (2026-09-12): the
+    pytorch/pytorch runtime image ships no libEGL.so.1 at all, so PyOpenGL
+    fails at import time ("'NoneType' object has no attribute
+    'eglQueryString'") before mujoco.Renderer is ever reached.
+
+    NVIDIA_DRIVER_CAPABILITIES is NOT the fix for this and must NOT be added
+    to submit()'s env — HF Jobs rejects it as a reserved variable (confirmed
+    2026-09-12: "Bad Request: Reserved environment variable ... cannot be
+    set"), so don't reintroduce it without checking that's changed."""
     src = (_ROOT / "src/mjlab_microduck/hf_jobs.py").read_text()
     assert "libegl1" in src, "BOOTSTRAP must apt-install libegl1 for --video on HF Jobs"
-    assert '"NVIDIA_DRIVER_CAPABILITIES": "all"' in src, (
-        "submit() must request graphics capability or the GPU's EGL ICD never mounts"
+    assert '"NVIDIA_DRIVER_CAPABILITIES":' not in src, (
+        "HF Jobs rejects this as a reserved env var — submission fails outright if set "
+        "(a comment mentioning the name is fine; setting it as a dict key is not)"
     )
 
 
