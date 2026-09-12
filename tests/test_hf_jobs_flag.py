@@ -165,6 +165,20 @@ def test_submitted_job_env_selects_egl_for_headless_rendering():
     )
 
 
+def test_bootstrap_installs_libegl_and_requests_graphics_capability():
+    """MUJOCO_GL=egl alone isn't enough on this image (2026-09-12):
+    - the pytorch/pytorch runtime image ships no libEGL.so.1 at all (import
+      crash: PyOpenGL's eglQueryString is None) until libegl1 is apt-installed;
+    - and even with libEGL present, NVIDIA's container runtime only mounts the
+      GPU's EGL vendor ICD when "graphics" is requested via
+      NVIDIA_DRIVER_CAPABILITIES (the base image defaults to compute-only)."""
+    src = (_ROOT / "src/mjlab_microduck/hf_jobs.py").read_text()
+    assert "libegl1" in src, "BOOTSTRAP must apt-install libegl1 for --video on HF Jobs"
+    assert '"NVIDIA_DRIVER_CAPABILITIES": "all"' in src, (
+        "submit() must request graphics capability or the GPU's EGL ICD never mounts"
+    )
+
+
 # The load-bearing assumption, exercised through the real import paths: both
 # `from mjlab.scripts.train import main` (mjlab's shim) and our own shim must
 # reach the hook before mjlab parses argv. In a subprocess, because it ends in

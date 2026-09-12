@@ -48,7 +48,12 @@ BOOTSTRAP = r"""
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get install -qq -y --no-install-recommends git curl ca-certificates xz-utils >/dev/null
+# libegl1: the pytorch/pytorch runtime image ships no OpenGL/EGL client
+# library at all, so mujoco's EGL backend (needed by --video's offscreen
+# renderer; see MUJOCO_GL below) fails at IMPORT time with
+# "'NoneType' object has no attribute 'eglQueryString'" — PyOpenGL can't even
+# dlopen libEGL.so.1, let alone reach a GPU vendor ICD. Hit 2026-09-12.
+apt-get install -qq -y --no-install-recommends git curl ca-certificates xz-utils libegl1 libgl1 >/dev/null
 # Pinned uv: the cache bucket persists across jobs, and a floating "latest" uv
 # reading entries written by an older uv corrupts installs (seen 2026-07-21:
 # bam's built-wheel cache entry from a 0.9.x-era job made 0.11.30 fail with
@@ -333,6 +338,12 @@ def submit(argv: list[str]) -> int:
         # this here (container env, before the job's Python even starts) is
         # the fix; it's a no-op for non-video runs, so left unconditional.
         "MUJOCO_GL": "egl",
+        # The NVIDIA container runtime only mounts the GPU's EGL vendor ICD
+        # (the actual hardware backend behind libEGL) when "graphics" is in
+        # this list — the base image's default omits it (compute-only).
+        # Without the ICD, libEGL loads (once libegl1 is installed, above)
+        # but eglGetDisplay/eglInitialize have nothing to bind to.
+        "NVIDIA_DRIVER_CAPABILITIES": "all",
     }
     secrets: dict[str, str] = {"HF_TOKEN": token}
 
