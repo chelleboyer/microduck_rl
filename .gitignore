@@ -38,3 +38,6 @@ backup_onnx/
 logdir/.claude/
 logdir/
 logdir/.claude/worktrees/
+
+# Claude Code worktrees — full nested checkouts, never part of the repo
+.claude/worktrees/

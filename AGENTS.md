@@ -8,6 +8,22 @@ the real robot. Sim2real transfer
 is the whole point: every convention below exists because breaking it produced a
 policy that worked in the viewer and failed on hardware.
 
+## Work in progress — read this first
+
+Branch `feat/hop-env-training`: the forward-hop env (`Mjlab-Hop-MicroDuck`) is mid-recovery
+after two failed runs. **The active plan is `.claude/plans/microduck-forward-hop.md`** — it is
+untracked, so it will not show up in a file listing; open it directly before touching the hop.
+
+State as of 2026-09-13: four structural defects fixed in the working tree (mid-air gate seeded
+on its own zero point; a sticky ground taint that made "do nothing" the argmax for most of each
+episode; forward credit measured from the spawn point instead of from liftoff; an unmeasured
+`UNWEIGHT_FORCE_N`). A fifth is open and is task 1 of the plan: the mid-air spawn ranges imply
+hops of 0.175–0.383 s of air time against a `TARGET_AIR_TIME` of 0.15 s. Suite green at 221.
+
+No local CUDA device on this machine — every training run needs `--hf-jobs`. Measuring
+constants does not: the model compiles and steps on CPU, and `scripts/infer_policy.py`
+(`load_bam_model`, `load_mujoco_with_bam`) is the CPU BAM harness.
+
 ## Commands
 
 ```bash
