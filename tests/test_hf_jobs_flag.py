@@ -235,3 +235,63 @@ def test_both_train_shims_reach_the_hook_before_parsing_argv(shim):
     assert proc.returncode == 0, f"probe failed:\n{proc.stderr[-2000:]}"
     assert f"SUBMIT ['{_TASK}', '--env.scene.num-envs', '4096']" in proc.stdout
     assert "EXIT 7" in proc.stdout
+
+
+# ── HF Jobs bootstrap: the post-training ONNX auto-export ────────────────────
+
+
+def _bootstrap_ckpt_glob() -> str:
+    """The `ls -t ...` checkpoint-discovery line from the bootstrap script."""
+    import re
+
+    from mjlab_microduck.hf_jobs import BOOTSTRAP
+
+    m = re.search(r"^\s*CKPT=\$\((ls -t .*?)\s*2>/dev/null", BOOTSTRAP, re.M)
+    assert m, "could not find the CKPT discovery line in BOOTSTRAP"
+    return m.group(1)
+
+
+def test_auto_export_glob_finds_a_real_checkpoint_layout(tmp_path):
+    """THE regression for a silent no-op (found 2026-09-13).
+
+    The glob was `logs/rsl_rl/*/model_*.pt`, but checkpoints land at
+    logs/rsl_rl/<experiment_name>/<run>/model_*.pt — three levels, since
+    every env cfg sets its own experiment_name. It matched nothing for
+    EVERY task in the repo, so the job printed "no checkpoint found",
+    skipped the export and still exited 0: a green `--hf-jobs` run never
+    meant an ONNX had been produced.
+
+    Exercised as a real shell glob against a real directory tree rather
+    than asserted as text, so it tests the behaviour and not the spelling.
+    """
+    import subprocess
+
+    import os
+
+    run = tmp_path / "logs" / "rsl_rl" / "microduck_hop" / "2026-09-13_21-20-20_microduck_hop"
+    run.mkdir(parents=True)
+    (run / "model_0.pt").write_text("x")
+    (run / "model_4.pt").write_text("x")
+    # Set mtimes explicitly: written back-to-back the two can land in the
+    # same filesystem timestamp tick, and `ls -t` then breaks the tie by
+    # name — which would make the "newest" assertion below flaky.
+    os.utime(run / "model_0.pt", (1_000_000, 1_000_000))
+    os.utime(run / "model_4.pt", (2_000_000, 2_000_000))
+
+    out = subprocess.run(
+        f"{_bootstrap_ckpt_glob()} 2>/dev/null | head -1",
+        shell=True, cwd=tmp_path, capture_output=True, text=True,
+    ).stdout.strip()
+
+    assert out, "the auto-export glob found no checkpoint in a real layout"
+    assert out.endswith("model_4.pt"), f"expected the newest checkpoint, got {out}"
+
+
+def test_auto_export_passes_the_full_checkpoint_path():
+    """export.py does `Path(checkpoint_file)` verbatim and takes log_dir from
+    its parent, so passing `basename` resolves to ./model_N.pt and fails.
+    The bootstrap used to do exactly that, behind the broken glob."""
+    from mjlab_microduck.hf_jobs import BOOTSTRAP
+
+    assert '--checkpoint-file "$CKPT"' in BOOTSTRAP
+    assert '--checkpoint-file "$(basename "$CKPT")"' not in BOOTSTRAP
