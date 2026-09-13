@@ -75,9 +75,44 @@ docstrings for the full reasoning.
     collected the forward reward AND opened the landing gate. The launch
     frame is now latched at liftoff.
 
-UNVERIFIED, run 1: every numeric constant below (EPISODE_LENGTH_S, air-time
-targets, mid-air spawn ranges, force_norm) is a plausible guess, not a sim
-measurement — this sandbox has no GPU to run mjlab's MuJoCo-Warp step, so
+Course correction 4 (2026-09-13, pre-run-3): four mechanisms ported from
+`ThomasBurgess2000/microduck-max-height-jump`, a community policy that DOES
+make this robot leave the ground (140 ms of air time, 0.628 m/s launch,
+31.67 mm sole clearance) and that was independently verified — its diff
+applies cleanly to d424a0c, its model change adds only massless
+non-colliding sites, and re-running its own eval reproduced every metric
+exactly. CPU measurement (scripts/measure_hop.py) had meanwhile established
+that the binding constraint on a hop is BALANCE DURING THE PUSH, not
+actuator power: torque peaks at 0.43 Nm against a 1.068 Nm clamp, and driven
+open-loop the robot rotates about its toe instead of rising (tilt 0.4 -> 95
+deg with both feet still down and trunk z falling). All four ports aim at
+that.
+  • A CROUCH spawn bucket. Both existing buckets practised LANDING — mid-air
+    directly, standing only after a liftoff the policy cannot yet do — so
+    the hard half got no reverse-curriculum support at all. The pose's
+    magnitudes come from the jump; its SIGNS were measured against this
+    compiled model (see CROUCH_OVERRIDES), since the jump trains on the
+    all-collisions model and a guessed sign is a different pose.
+  • hop_launch_velocity, dense shaping on upward velocity while still
+    loaded. It is the only signal available BEFORE a liftoff has ever
+    happened, and it shapes the objective itself rather than a proxy: air
+    time, apex and takeoff speed are one number wearing three hats.
+  • hop_airborne_tilt + hop_lateral_drift, the attitude terms. The jump's
+    horizontal-drift cost is deliberately NARROWED to the lateral axis —
+    ported whole it would fight hop_forward_progress, since a forward hop
+    requires exactly the momentum that term punishes.
+  • A cfg.metrics block. Episode_Reward/<term> logs the WEIGHTED value, so a
+    term parked at weight 0 by a curriculum reads 0.0000 whatever the robot
+    does — which is how the inert-sensor bug hid for a full run. Read
+    valid_takeoff_rate and max_com_rise_mm FIRST on any run.
+
+UNVERIFIED, run 1 — PARTLY SUPERSEDED by the measurement pass recorded in
+`.claude/plans/microduck-forward-hop.md` (Phase 1) and by course correction 4
+above: STAND_Z, the mid-air spawn ranges and TARGET_AIR_TIME each now have a
+measured or verified answer that has NOT yet been applied to the constants
+below. Still true as written for EPISODE_LENGTH_S. Every numeric constant
+below (EPISODE_LENGTH_S, air-time targets, mid-air spawn ranges, force_norm)
+is a plausible guess, not a sim measurement — this sandbox has no GPU to run mjlab's MuJoCo-Warp step, so
 AGENTS.md step 2 ("verify physics assumptions in sim BEFORE training") could
 not be done. The mandatory next step before any real training run is the
 64-env / 5-iteration smoke test, which will need to run somewhere with a
@@ -156,6 +191,42 @@ MIDAIR_VX_RANGE = (0.0, 0.6)     # forward speed at landing, UNVERIFIED — a fo
                                   # landing/recovery half of the reverse curriculum only ever
                                   # practices a dead-stop landing and won't transfer
 
+# ── Crouch spawn (reverse curriculum applied to the START of the hop) ────────
+# The loaded pre-push pose. Ported from the verified jump policy, whose leg
+# pitch chain sits at magnitudes (hip_pitch, knee, ankle) = (0.4188, 1.3776,
+# 0.9588); the SIGNS were measured against this compiled model rather than
+# carried over, because the jump trains on the all-collisions model and a
+# guessed sign is a different pose entirely. Measured with
+# scripts/measure_hop.py's exact-kinematics helpers: this pose rests at trunk
+# z = 0.0658 m, while the sign-flipped variant rests at 0.1078 m — barely
+# below HOME's 0.1172 m and not a crouch at all.
+CROUCH_OVERRIDES = {
+    2:  0.4188,   # left_hip_pitch
+    3:  1.3776,   # left_knee
+    4: -0.9588,   # left_ankle
+    11: -0.4188,  # right_hip_pitch
+    12: -1.3776,  # right_knee
+    13:  0.9588,  # right_ankle
+}
+# MEASURED: 0.0658 m is where the pose above rests on the floor (exact
+# kinematics, no load). The band sits just above it so joint noise cannot
+# spawn the robot interpenetrating the floor. The jump's own (0.068, 0.071)
+# is NOT used — AGENTS.md: never carry a target height across models.
+CROUCH_Z_RANGE = (0.066, 0.070)
+
+# Spawn mix at step 0. Mirrors the jump's standing/crouch/descending split;
+# "descending" is this task's mid-air bucket.
+SPAWN_STANDING_PROB = 0.35
+SPAWN_CROUCH_PROB   = 0.35
+SPAWN_MIDAIR_PROB   = 0.30
+
+# Upward trunk velocity, still loaded, that earns full launch credit. The
+# verified jump policy reaches 0.628 m/s and scales its own reward at 0.60.
+# Do NOT size this off measure_hop.py's 0.385 m/s push-off figure — that
+# bounds hand-designed open-loop profiles, not the robot (the script's
+# CEILING CAVEAT says so explicitly).
+TARGET_LAUNCH_VZ = 0.60
+
 _LEG_JOINTS = [0, 1, 2, 3, 4, 9, 10, 11, 12, 13]
 
 from mjlab.envs import ManagerBasedRlEnvCfg
@@ -164,6 +235,7 @@ from mjlab.envs.mdp.actions import JointPositionActionCfg
 from mjlab.managers import (
     CurriculumTermCfg,
     EventTermCfg,
+    MetricsTermCfg,
     ObservationTermCfg,
     RewardTermCfg,
     TerminationTermCfg,
@@ -279,6 +351,23 @@ def make_microduck_hop_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         params={"force_norm": UNWEIGHT_FORCE_N},
     )
 
+    # Dense shaping on the quantity that DETERMINES the hop, and the only one
+    # available BEFORE a liftoff has ever happened (air time, apex and takeoff
+    # speed are one number wearing three hats). Ported from the verified jump
+    # policy, which scales at 0.60 m/s and reaches 0.628.
+    #
+    # Weight 3.0, not the jump's 2.0: AGENTS.md says to compare reward MASS,
+    # not weights, when moving a term between envs. This stack's positive
+    # terms sum to ~23.5, so 2.0 would be a ~8% share; 3.0 makes the one term
+    # that can guide the undiscovered push-off a visible fraction of the
+    # payoff instead of a rounding error, which is the failure mode the
+    # existing hop_unweighting term at weight 1.0 already demonstrates.
+    cfg.rewards["hop_launch_velocity"] = RewardTermCfg(
+        func=microduck_mdp.hop_launch_velocity_progress,
+        weight=3.0,
+        params={"target_velocity": TARGET_LAUNCH_VZ, "max_paid_rate": 1.0},
+    )
+
     # The one dense task signal once liftoff is real: paid increments of the
     # simultaneous-air-time frontier, capped so a longer hop isn't worth
     # arbitrarily more than a controlled one.
@@ -354,10 +443,71 @@ def make_microduck_hop_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         weight=0.0,
     )
 
+    # Airborne attitude. These target the failure mode the CPU measurement
+    # harness actually found: driven open-loop the robot rotates about its toe
+    # instead of rising (tilt 0.4 -> 95 deg with both feet still down and
+    # trunk z falling), and nothing in the stack charged for it.
+    #
+    # Live from step 0 rather than curriculum-ramped, which is a deliberate
+    # exception to the AGENTS.md "introduce taxes after the skill exists"
+    # rule: both are gated on being genuinely airborne, so they are
+    # unreachable until a liftoff exists and cannot tax attempts. For the
+    # same reason neither can block a fallen robot's recovery — a prone robot
+    # is not airborne.
+    #
+    # Ordinary costs (return >= 0) -> NEGATIVE weights.
+    cfg.rewards["hop_airborne_tilt"] = RewardTermCfg(
+        func=microduck_mdp.hop_airborne_tilt_penalty,
+        weight=-0.4,
+    )
+    # The jump's horizontal-drift cost, narrowed to the lateral axis only —
+    # ported whole it would fight hop_forward_progress, since a forward hop
+    # requires exactly the horizontal momentum that term punishes.
+    cfg.rewards["hop_lateral_drift"] = RewardTermCfg(
+        func=microduck_mdp.hop_lateral_drift_penalty,
+        weight=-0.5,
+    )
+
     cfg.rewards["self_collisions"] = RewardTermCfg(
         func=mdp.self_collision_cost,
         weight=-0.2,
         params={"sensor_name": self_collision_cfg.name},
+    )
+
+    # ── Metrics: physical outcomes, independent of reward weights ─────────────
+    # Episode_Reward/<term> logs the WEIGHTED value, so a term parked at
+    # weight 0 by a curriculum reads 0.0000 whatever the robot does. These
+    # report what actually happened instead. Read valid_takeoff_rate and
+    # max_com_rise_mm FIRST on any run — they are the two that say whether a
+    # hop occurred at all.
+    hop_feet_sites = SceneEntityCfg("robot", site_names=("left_foot", "right_foot"))
+    cfg.metrics["valid_takeoff_rate"] = MetricsTermCfg(
+        func=microduck_mdp.hop_metric_valid_takeoff,
+        params={"min_air_time": HOP_MIN_AIR_TIME},
+        reduce="last",
+    )
+    cfg.metrics["max_air_time_s"] = MetricsTermCfg(
+        func=microduck_mdp.hop_metric_max_air_time,
+        reduce="last",
+    )
+    cfg.metrics["max_launch_velocity_mps"] = MetricsTermCfg(
+        func=microduck_mdp.hop_metric_max_launch_velocity,
+        reduce="last",
+    )
+    cfg.metrics["max_com_rise_mm"] = MetricsTermCfg(
+        func=microduck_mdp.hop_metric_com_rise_mm,
+        params={"foot_site_cfg": hop_feet_sites},
+        reduce="last",
+    )
+    cfg.metrics["max_foot_rise_mm"] = MetricsTermCfg(
+        func=microduck_mdp.hop_metric_foot_rise_mm,
+        params={"foot_site_cfg": hop_feet_sites},
+        reduce="last",
+    )
+    cfg.metrics["stable_landing_rate"] = MetricsTermCfg(
+        func=microduck_mdp.hop_metric_stable_landing,
+        params={"target_height": STAND_Z, "min_air_time": HOP_MIN_AIR_TIME},
+        reduce="last",
     )
 
     # Always-on upright would oppose the push-off/flight phase; landing
@@ -473,11 +623,15 @@ def make_microduck_hop_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         func=microduck_mdp.reset_hop_state,
         mode="reset",
         params={
-            "standing_prob":     0.5,
-            "midair_prob":       0.5,
+            "standing_prob":     SPAWN_STANDING_PROB,
+            "crouch_prob":       SPAWN_CROUCH_PROB,
+            "midair_prob":       SPAWN_MIDAIR_PROB,
             "standing_z_min":    0.11,
             "standing_z_max":    0.12,
             "standing_tilt_max": math.radians(5.0),
+            "crouch_z_min":      CROUCH_Z_RANGE[0],
+            "crouch_z_max":      CROUCH_Z_RANGE[1],
+            "crouch_overrides":  CROUCH_OVERRIDES,
             "midair_z_min":      MIDAIR_Z_MIN,
             "midair_z_max":      MIDAIR_Z_MAX,
             "midair_vz_range":   MIDAIR_VZ_RANGE,
@@ -567,17 +721,33 @@ def make_microduck_hop_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         del cfg.curriculum["terrain_levels"]
     del cfg.curriculum["command_vel"]
 
-    # Reverse-curriculum mix: heavy mid-air early (landing/recovery is
-    # learnable from day 0), shift toward standing starts as liftoff gets
-    # discovered. Mid-air never goes to zero — it keeps recovery practiced.
+    # Reverse-curriculum mix over THREE buckets. Both ends of the maneuver get
+    # spawn support early — crouch practises the push-off (measured to be the
+    # hard half), mid-air practises landing/recovery — and both give way to
+    # standing starts, which is the only bucket that requires the whole hop
+    # end to end and the only one that matches deployment.
+    #
+    # Neither assist goes to zero: mid-air keeps recovery practised, and
+    # crouch keeps the push frontier on-policy. AGENTS.md: don't harden the
+    # spawn mix before the current slice consolidates — if a metric steps DOWN
+    # exactly at one of these boundaries, stretch the stages, don't advance
+    # them.
     cfg.curriculum["hop_spawn_mix"] = CurriculumTermCfg(
         func=microduck_mdp.event_param_curriculum,
         params={
             "event_name": "set_hop_state",
             "param_stages": [
-                {"step": 0,          "params": {"standing_prob": 0.50, "midair_prob": 0.50}},
-                {"step": 1500 * 24,  "params": {"standing_prob": 0.65, "midair_prob": 0.35}},
-                {"step": 3000 * 24,  "params": {"standing_prob": 0.80, "midair_prob": 0.20}},
+                {"step": 0, "params": {
+                    "standing_prob": SPAWN_STANDING_PROB,
+                    "crouch_prob":   SPAWN_CROUCH_PROB,
+                    "midair_prob":   SPAWN_MIDAIR_PROB,
+                }},
+                {"step": 1500 * 24, "params": {
+                    "standing_prob": 0.50, "crouch_prob": 0.25, "midair_prob": 0.25,
+                }},
+                {"step": 3000 * 24, "params": {
+                    "standing_prob": 0.65, "crouch_prob": 0.15, "midair_prob": 0.20,
+                }},
             ],
         },
     )
