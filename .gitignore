@@ -41,3 +41,6 @@ logdir/.claude/worktrees/
 
 # Claude Code worktrees — full nested checkouts, never part of the repo
 .claude/worktrees/
+
+# Machine-local Claude Code permissions — personal, not shared with the repo
+.claude/settings.local.json
