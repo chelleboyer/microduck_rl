@@ -623,3 +623,183 @@ design step, not because the tuning was worse.
 ## AMENDMENTS
 
 <!-- Append-only. Newest at the bottom. -->
+
+---
+
+## AMENDMENT 1 — 2026-09-13: port four mechanisms from the verified jump policy
+
+### Why this amendment exists
+
+A community policy, `ThomasBurgess2000/microduck-max-height-jump`, trains
+`Mjlab-Jump-Flat-MicroDuck` on the all-collisions model and **does** leave the
+ground: 140 ms of air time, 0.628 m/s launch velocity, 31.67 mm of bilateral
+sole clearance, no non-foot ground contact.
+
+That result was independently verified this session, not taken on trust:
+
+- its published `working-tree.diff` applies to base revision `d424a0c` with zero
+  conflicts and reproduces the tree its README describes;
+- its robot-model change adds ONLY MuJoCo `site` elements (massless,
+  inertia-less, non-colliding) — no gravity, mass, timestep, armature,
+  frictionloss, solref/solimp or forcerange change anywhere in the diff;
+- its metrics are ballistically self-consistent (140 ms = exactly 7 control
+  steps at 50 Hz; CoM rise 32.59 mm = 20.07 mm ballistic + 12.5 mm pre-takeoff
+  extension; sole clearance = ballistic + 11.6 mm of in-flight leg tuck);
+- re-running its own eval unmodified on HF Jobs (job
+  `6aa6c3b621047bf1b038461f`, reconstructed from public sources) reproduced
+  **every metric of both evaluations exactly**.
+
+### Correction to Phase 1 — read before applying any Phase 2 constant
+
+**The `pushoff` capability bound from Phase 1 is RETRACTED as a ceiling.** It
+measured 0.385 m/s with the trunk constrained upright; the verified jump reaches
+0.628 m/s, 63% higher. The bound was a bound on hand-designed open-loop profiles
+with the head and hip roll/yaw frozen, and a trained policy beats it.
+
+Consequences, and they are load-bearing:
+
+- **Do NOT apply the `ranges` output derived at `T = 0.052 s`.** Re-derive
+  against the verified ~0.14 s instead. `TARGET_AIR_TIME = 0.15 s` now looks
+  approximately right rather than impossible.
+- The plan's stated biggest risk ("Assumed — `TARGET_AIR_TIME = 0.15 s` is
+  physically achievable") resolves **YES**.
+- Two failed runs are therefore explained by the reward defects already
+  identified, not by an impossible target.
+- What Phase 1 did establish and which still stands: `STAND_Z` measures 0.1172 m
+  kinematically (cfg says 0.115, delta +2.2 mm); full extension is 0.1408 m,
+  cross-checked against the roller-standup spec's independently measured
+  `debout 0.1407`; HOME is already a ~24 mm crouched stand; and the binding
+  constraint on a hop is **balance during the push**, not actuator power
+  (torque peaked at 0.43 Nm of a 1.068 Nm clamp, joint speed at 7.3 of
+  22.4 rad/s no-load).
+
+### Resequencing
+
+These four tasks go BEFORE the existing Phase 2 tasks. They target the failure
+the env actually has. The forward-objective gating (AC #3) stays as planned and
+runs after them.
+
+Reference tree: the reconstructed jump source is the authority for these ports.
+Its reward functions all route through a shared `_update_jump_state(env, asset,
+feet_cfg)` bookkeeping helper, so **this is not copy-paste** — the hop has its
+own state machine (`_update_hop_clean_time`, `_update_hop_accum`,
+`_update_hop_forward_accum`) and each port must be re-expressed against it,
+keeping the step-guard convention.
+
+### ADD a crouch spawn bucket to `reset_hop_state`
+
+- **IMPLEMENT**: a third spawn bucket that starts the episode in a loaded
+  crouch, alongside the existing standing and mid-air buckets. Mirror the jump's
+  split as a starting point (standing 0.35 / crouch 0.35 / descending 0.30) and
+  its `CROUCH_OVERRIDES` joint angles (leg pitch chain indices 2,3,4 and
+  11,12,13 at `0.4188, 1.3776, 0.9588` mirrored) with a crouch trunk height near
+  `CROUCH_Z_RANGE = (0.068, 0.071)`.
+- **WHY — the single biggest gap.** The hop's reverse curriculum spawns standing
+  or mid-AIR: it practices landing but never launching. Phase 1 showed the
+  push-off is exactly where the robot topples, so the hard half of the maneuver
+  currently gets no reverse-curriculum support at all. AGENTS.md: "Reverse
+  curriculum spawns are the reliable fix for 'learns the start, never the last
+  mile'" — here the un-practised frontier is the START.
+- **GOTCHA**: never hardcode joint indices — resolve through `_servo_joint_ids`
+  so the backlash model stays correct. The jump's own comment says it resolves
+  entity joint ids for exactly this reason.
+- **GOTCHA**: a crouch is LESS stable than HOME open-loop (Phase 1 measured
+  0.16-0.28 s to 10 deg of tilt vs HOME's 0.9 s), so the crouch spawn must be
+  the pose the policy is expected to drive, not a settle target.
+- **VALIDATE**: `uv run --with pytest pytest tests/test_hop_cfg.py -q`
+- **SATISFIES**: AC #7, and unblocks AC #4
+
+### ADD a launch-velocity reward
+
+- **IMPLEMENT**: a dense progress reward on upward trunk/CoM velocity while the
+  feet are still loaded, mirroring `jump_launch_velocity_progress` (jump weight
+  2.0, `target_velocity` scale 0.60 m/s). Introduce it at a weight that is a
+  real fraction of the hop stack, not a rounding error.
+- **WHY**: it is dense, physically exact, and available BEFORE liftoff succeeds.
+  The hop's only discovery signal is `hop_unweighting` at weight 1.0 against a
+  ~23.5-point positive stack — the ~0.4%-of-payoff gradient this plan already
+  flagged as Branch C. Launch velocity is the quantity that *determines* the
+  hop: air time, apex and takeoff velocity are one number wearing three hats.
+- **GOTCHA**: scale it to a REACHABLE velocity. 0.60 m/s is the jump's scale and
+  0.628 m/s is what it achieves; the Phase 1 figure of 0.385 m/s is a retracted
+  floor, not a target.
+- **GOTCHA**: sign convention — a `*_progress` reward is positive-weighted.
+  Every `Episode_Reward/<penalty>` must still read <= 0.
+- **VALIDATE**: `uv run --with pytest pytest tests/test_hop_cfg.py -q`
+- **SATISFIES**: AC #4
+
+### ADD an airborne attitude penalty
+
+- **IMPLEMENT**: an airborne tilt cost mirroring `jump_airborne_tilt_cost`
+  (jump weight -0.4), active only while genuinely airborne.
+- **WHY**: Phase 1's diagnostic showed the dominant failure is the robot
+  rotating about its toe instead of rising — tilt 0.4 -> 95 deg with both feet
+  still in contact and trunk z FALLING. Nothing in the hop stack charges for
+  that. This is the term that targets the measured failure mode.
+- **DIVERGENCE FROM THE JUMP — do not port `jump_horizontal_drift_cost` as-is.**
+  The jump is vertical, so it penalises all horizontal drift (weight -0.5). A
+  forward hop REQUIRES horizontal momentum, so that term would fight
+  `hop_forward_progress` directly. Port it as a LATERAL-only (y-axis) drift
+  penalty, leaving the forward axis free.
+- **GOTCHA**: "airborne" must mean no robot geom touching the ground, not "both
+  feet off". Both this session's measurement harness AND an earlier version of
+  the hop env were fooled by a robot lying on its trunk with both feet up — the
+  butt-bounce exploit. Reuse `nonfoot_ground_contact`, do not re-derive it.
+- **VALIDATE**: `uv run --with pytest pytest tests/test_hop_cfg.py -q`
+- **SATISFIES**: AC #4, AC #6
+
+### ADD a `cfg.metrics` block of direct physical outcomes
+
+- **IMPLEMENT**: `cfg.metrics` terms logging the physical truth of each episode,
+  mirroring the jump's set: valid-takeoff rate, max CoM rise (mm), max bilateral
+  sole clearance (mm), max air time, stable/durable landing rate.
+  `MetricsTermCfg` is importable from `mjlab.managers` in this tree (verified),
+  signature `(func, params, *, per_substep=False, reduce='mean'|'last')`; the
+  jump uses `reduce="last"`.
+- **WHY**: the jump's own comment states it plainly — "Physical episode outcomes
+  are logged directly; weighted reward mass is no longer the only way to infer
+  whether a real jump happened." The hop has NO metrics block, so it is fully
+  exposed to the AGENTS.md footgun this plan already cites: `Episode_Reward/<term>`
+  logs the WEIGHTED value, so a term at weight 0 reads 0 regardless of behavior.
+  That is how the inert-sensor bug hid for a full run, and with
+  `hop_forward_progress` about to be weight-gated to 0 for 1500 iterations
+  (AC #3), run 3 would otherwise be unreadable by construction.
+- **GOTCHA**: `left_foot` / `right_foot` SITES already exist on
+  `robot_groundcontact.xml` (verified), so the takeoff/rise/landing metrics need
+  NO model change. Only a sole-clearance metric would want the jump's added
+  `passive_*_sole_probe_*` sites — either add them the same way (sites are
+  massless and non-colliding, so this is measurement-only and cannot change
+  physics) or compute min sole-vertex height directly.
+- **WHY THIS IS CHEAP AND HIGH-VALUE**: it is additive, changes no reward, and
+  makes run 3 interpretable whichever way it goes.
+- **VALIDATE**: `uv run --with pytest pytest tests/test_hop_cfg.py -q`
+- **SATISFIES**: AC #4, AC #7
+
+### Noted but NOT adopted in this amendment
+
+Deliberate scope control — each is a separate decision, recorded so the reasoning
+is not lost:
+
+- **Performance-gated curricula** (`jump_*_performance_curriculum`) instead of
+  the hop's fixed `step: N*24` stages. Strictly better-aligned with the AGENTS.md
+  rule about phase-aligning stages, but it changes every curriculum at once and
+  would make run 3 unattributable. Revisit after run 3.
+- **Negative episode mass on failed recovery** (`failed_landing` at -8.0 plus a
+  failure termination), so early crashing cannot dodge accumulated cost by
+  shortening the episode. The hop has no failure cost at all. Strong candidate
+  for run 4.
+- **Uncapped height objective** (`cap_at_target: False`, `log_scale: True`).
+  The hop's air-time target saturates; the jump pays for exceeding its 12 mm
+  scale and reached 31.67 mm. Relevant only once liftoff exists.
+- **Takeoff qualified on geometric clearance** (`TAKEOFF_CLEARANCE_MIN_M =
+  0.003`) rather than a pure time gate. Structurally harder to fake than
+  `HOP_MIN_AIR_TIME` alone.
+- **Stance-width cost** — the jump's own standalone eval fails its durable
+  criterion with the feet 37.26 mm apart. The hop prices nothing on stance width.
+
+### Amended run-3 watchlist
+
+Supersedes the watchlist in "RUN 3 — probe": watch the new `cfg.metrics` series
+FIRST (`valid_takeoff_rate`, `max_com_rise_mm`), because they report behavior
+independently of reward weights. The `Episode_Reward/*` checks still apply, and
+every penalty must still read <= 0.
