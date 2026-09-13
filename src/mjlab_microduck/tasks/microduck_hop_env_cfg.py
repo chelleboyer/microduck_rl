@@ -17,12 +17,11 @@ dominant strategy at ~1300/6000 iterations was a butt-bounce — trunk hits
 the ground, rebounds, both feet come off for a moment, some of that
 rebound happens to carry the robot forward. Every reward term up to that
 point only checked the FEET, so this satisfied every gate as well as a
-real leg-driven hop would have. trunk_ground_cfg + the taint mechanism in
-mdp.py (_update_hop_trunk_taint) close it: once the trunk has touched the
-ground this episode, no further hop-air-time, forward-distance, or
-unweighting credit is possible — see that function's docstring for why
-this can't penalize a genuine landing-and-recovery phase, only a
-trunk-assisted liftoff.
+real leg-driven hop would have. nonfoot_ground_cfg + the clean-time clock
+in mdp.py (_update_hop_clean_time) close it: hop credit requires the robot
+to have been free of non-foot ground contact for _HOP_CLEAN_LIFTOFF_S, and
+creditable air time is capped by how long it has been clean, so a
+trunk-assisted liftoff earns nothing.
 
 Course correction 2 (same day, run-2): fixing the butt-bounce revealed a
 SECOND exploit rather than a clean hop — "worming", where the policy
@@ -58,6 +57,23 @@ Design (see the "Hop" section of mdp.py for the full mechanism):
     half is learnable on its own" — here, landing-and-recovery is trained
     directly from an airborne, falling spawn state, without requiring
     liftoff to already work).
+
+Course correction 3 (2026-09-13, pre-run-3): three structural bugs, each of
+which silently removed most of the training signal. See the linked mdp.py
+docstrings for the full reasoning.
+  • reset_hop_state seeded the mid-air bucket's air-time frontier at exactly
+    gate_min_air_time, which is _hop_completion_gate's ZERO point — so all
+    four landing/recovery terms paid 0 for every mid-air episode. Both sites
+    now derive from mdp._HOP_GATE_FULL_OPEN.
+  • The butt-bounce taint was STICKY for the episode, so one topple pinned
+    the air-time frontier at 0 and left a reward function
+    (-action_rate -self_collisions) whose argmax is "do nothing" for the
+    remaining ~2.5 s. Replaced by the decaying clean-time clock, which
+    attributes credit per flight instead of per episode.
+  • hop_forward_progress measured displacement from the SPAWN point, so
+    "lunge forward on the feet, then stumble through four airborne frames"
+    collected the forward reward AND opened the landing gate. The launch
+    frame is now latched at liftoff.
 
 UNVERIFIED, run 1: every numeric constant below (EPISODE_LENGTH_S, air-time
 targets, mid-air spawn ranges, force_norm) is a plausible guess, not a sim
@@ -113,12 +129,23 @@ EPISODE_LENGTH_S = 3.0
 # (same robot model, same standing pose) — not re-measured here.
 STAND_Z = 0.115
 
+# Every robot body EXCEPT the two ankles (which own left/right_foot_collision,
+# the only geoms allowed to touch the ground). Used by nonfoot_ground_cfg —
+# see the long comment there for why matching trunk_base alone was wrong.
+NONFOOT_BODY_PATTERN = r"^(?!ankle_).*"
+FOOT_BODIES = ("ankle_left", "ankle_right")
+
 # ── Hop targets (UNVERIFIED — see file header) ───────────────────────────────
 TARGET_AIR_TIME    = 0.15   # s of simultaneous air time that earns full progress credit
 HOP_MIN_AIR_TIME   = 0.06   # s that opens the landing/recovery gate
-UNWEIGHT_FORCE_N   = 8.0    # ≈ body weight in Newtons; recompute as mass*9.81 once measured
-TARGET_FORWARD_DIST = 0.08  # m of airborne forward travel that earns full progress credit —
-                             # a guess for a 25 cm robot's standing broad-hop, not a measurement
+UNWEIGHT_FORCE_N   = 7.23   # MEASURED: compiled model total mass 0.7372 kg * 9.81
+TARGET_FORWARD_DIST = 0.05  # m of forward travel FROM LIFTOFF that earns full credit.
+                             # Was 0.08 while this was (wrongly) measured from the spawn
+                             # point; from-liftoff is a strictly harder target, and 0.05 is
+                             # what TARGET_AIR_TIME buys at a modest ~0.33 m/s horizontal
+                             # launch speed. Still a guess — but a deliberately reachable
+                             # one, so the term saturates instead of paying for violence.
+                             # Raise it once a run has produced a hop worth measuring.
 
 # ── Mid-air spawn (reverse curriculum) ───────────────────────────────────────
 MIDAIR_Z_MIN  = 0.14
@@ -183,15 +210,30 @@ def make_microduck_hop_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         num_slots=1,
     )
 
-    # Closes the butt-bounce exploit (see mdp.hop_forward_progress module
-    # docstring / _update_hop_trunk_taint): mode="body" (not "subtree",
-    # unlike self_collision_cfg above) restricts this to geoms owned
-    # directly by the trunk_base body — the torso shell itself, not the legs
-    # or head hanging off it — against the terrain. Any hit here means the
-    # push-off wasn't leg-driven.
-    trunk_ground_cfg = ContactSensorCfg(
-        name="trunk_ground_contact",
-        primary=ContactMatch(mode="body", pattern="trunk_base", entity="robot"),
+    # "Any part of the robot EXCEPT a foot is touching the ground."
+    #
+    # Watches every non-ankle body, NOT just trunk_base. The first version of
+    # this sensor matched `pattern="trunk_base"` alone and was completely
+    # inert: measured with a CPU MuJoCo drop test (robot settled belly-down,
+    # trunk z=0.035 against the 0.115 standing target), the floor contacts
+    # are `hip_l`×3, `hip_l_2`×3, `jaw_soft`×1 and the two feet — trunk_base
+    # appears nowhere, because the torso shell never reaches the floor. Both
+    # ground-cheat fixes therefore never once fired, and
+    # `Episode_Reward/hop_no_crawl` read exactly 0.0000 for a whole run while
+    # the video plainly showed the robot prone. Watch the bodies that
+    # actually bear weight, not the one the behaviour is named after.
+    #
+    # A negative lookahead rather than an explicit body list, so a future
+    # model revision that adds a collidable body is covered without anyone
+    # remembering to update this — and
+    # test_ground_sensor_covers_every_nonfoot_collision_body asserts exactly
+    # that against the compiled model, so an inert sensor cannot recur
+    # silently.
+    nonfoot_ground_cfg = ContactSensorCfg(
+        name="nonfoot_ground_contact",
+        primary=ContactMatch(
+            mode="body", pattern=NONFOOT_BODY_PATTERN, entity="robot"
+        ),
         secondary=ContactMatch(mode="body", pattern="terrain"),
         fields=("found",),
         reduce="none",
@@ -204,7 +246,7 @@ def make_microduck_hop_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     cfg = make_velocity_env_cfg()
 
     cfg.scene.entities = {"robot": MICRODUCK_STANDUP_ROBOT_CFG}
-    cfg.scene.sensors  = (feet_ground_cfg, self_collision_cfg, trunk_ground_cfg)
+    cfg.scene.sensors  = (feet_ground_cfg, self_collision_cfg, nonfoot_ground_cfg)
     cfg.viewer.body_name = "trunk_base"
 
     cfg.episode_length_s = EPISODE_LENGTH_S

@@ -7232,6 +7232,15 @@ def roulade_lateral_velocity_penalty(
 # (reset_hop_state), not world +x, because spawn yaw is randomized.
 
 
+# The completion gate ramps from 0 at ``min_air_time`` to 1 at
+# ``min_air_time * _HOP_GATE_FULL_OPEN``. reset_hop_state seeds the mid-air
+# reverse-curriculum bucket with the SAME factor, so "spawned already
+# airborne" means the landing gate is fully open, not sitting on its zero
+# point. Both sites must use this one constant — see
+# test_hop_midair_spawn_opens_the_landing_gate for why.
+_HOP_GATE_FULL_OPEN = 1.5
+
+
 def _hop_state(env: ManagerBasedRlEnv) -> tuple:
     if not hasattr(env, "_hop_max_air_time"):
         z = torch.zeros(env.num_envs, device=env.device)
@@ -7244,35 +7253,87 @@ def _hop_state(env: ManagerBasedRlEnv) -> tuple:
         env._hop_max_forward_dist = z.clone()
         env._hop_fwd_paid = z.clone()
         env._hop_last_fwd_update_step = -1
-        env._hop_trunk_touched_ground = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+        env._hop_clean_time = z.clone()
+        env._hop_last_clean_step = -1
+        env._hop_in_flight = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
     return env._hop_max_air_time, env._hop_paid, env._hop_completed
 
 
-def _update_hop_trunk_taint(env: ManagerBasedRlEnv, sensor_name: str = "trunk_ground_contact") -> None:
-    """Sticky per-episode flag: has the trunk touched the ground THIS episode.
+# How long the robot must be free of non-foot ground contact before any hop
+# credit is reachable. A butt-bounce's liftoff happens within a few ms of its
+# trunk push, so it can never clear this; a genuine standing robot clears it
+# permanently, and a robot recovering from a bad landing re-clears it simply
+# by standing back up. See _update_hop_clean_time.
+_HOP_CLEAN_LIFTOFF_S = 0.15
 
-    Closes a real exploit found in training on 2026-09-12: nothing checked
-    what the TRUNK was doing during liftoff, only the feet, so the policy's
-    dominant strategy became a butt-bounce — trunk-to-ground push-off — which
-    satisfies "both feet off the ground" just as well as a real leg-driven
-    hop does. Once tripped, this flag never clears (matches
-    _hop_completion_gate's own "stays open for the rest of the episode"
-    reasoning) — it only ever PREVENTS further credit
-    (_update_hop_accum / _update_hop_forward_accum mask their frontier
-    updates by it), never revokes credit already banked, so it cannot
-    penalize a genuine hop's landing-and-recovery phase (which is allowed to
-    touch the ground, same as roulade) — only a trunk-ground touch BEFORE
-    real liftoff is ever earned.
 
-    Idempotent and safe to call from multiple reward terms in the same
-    step — unlike the frontier updates, OR-ing an already-true (or
-    unchanged) value needs no step-guard.
+def _update_hop_clean_time(env: ManagerBasedRlEnv, sensor_name: str = "nonfoot_ground_contact") -> None:
+    """Track seconds since any NON-FOOT body last touched the ground.
+
+    Replaces the sticky per-episode taint flag this task carried until
+    2026-09-13. The flag closed the butt-bounce exploit (a trunk push-off
+    satisfies "both feet off the ground" as well as a leg-driven hop does)
+    but it never cleared, so it also destroyed the rest of the episode:
+    with the air-time frontier pinned at 0, _hop_completion_gate could never
+    open, and EVERY positive hop term evaluated to 0 for the remaining ~2.5 s
+    of a 3.0 s episode. What was left was ``-0.1*action_rate
+    -0.2*self_collisions`` — a reward function whose argmax is "do nothing".
+    An untrained robot topples in well under a second, so the standing bucket
+    was training freeze far more than it was training a hop.
+
+    A decaying clock fixes the scope without weakening the gate. Credit is
+    attributed PER FLIGHT rather than per episode:
+
+      * butt-bounce — trunk contact ends and the feet leave a few ms later,
+        so clean_time is ~0 at liftoff and the whole flight is masked;
+      * prone with both feet in the air — nonfoot contact is CONTINUOUS, so
+        the clock is pinned at 0 the entire time;
+      * genuine hop — nothing but feet has touched all episode, so the clock
+        is far past the threshold by liftoff and the flight pays in full;
+      * recovery then hop — standing back up necessarily means a stretch of
+        feet-only contact, which re-earns eligibility with no separate
+        "has recovered" predicate to define or tune.
+
+    Step-guarded: unlike the old idempotent OR, this integrates, so it must
+    advance exactly once per control step no matter how many reward terms
+    read it.
     """
     _hop_state(env)
-    if sensor_name in env.scene.sensors:
-        found = env.scene.sensors[sensor_name].data.found
-        touched_now = torch.nan_to_num(found, nan=0.0).reshape(found.shape[0], -1).any(dim=-1).bool()
-        env._hop_trunk_touched_ground = env._hop_trunk_touched_ground | touched_now
+    step = int(env.common_step_counter)
+    if step == env._hop_last_clean_step:
+        return
+    env._hop_last_clean_step = step
+    if sensor_name not in env.scene.sensors:
+        env._hop_clean_time = env._hop_clean_time + env.step_dt
+        return
+    found = env.scene.sensors[sensor_name].data.found
+    touching = torch.nan_to_num(found, nan=0.0).reshape(found.shape[0], -1).any(dim=-1)
+    env._hop_clean_time = torch.where(
+        touching,
+        torch.zeros_like(env._hop_clean_time),
+        env._hop_clean_time + env.step_dt,
+    )
+
+
+def _hop_clean_air_budget(env: ManagerBasedRlEnv) -> torch.Tensor:
+    """Upper bound on creditable air time: how long the robot has been clean.
+
+    Capping the frontier by this — rather than only masking it — closes the
+    hole a bare eligibility test would leave open. A robot lying on its back
+    with both feet in the air accumulates real ``foot_air_time`` the whole
+    time it is prone; without the cap, the instant it broke nonfoot contact
+    for long enough it would cash seconds of accumulated "air time" as one
+    jackpot. With the cap, air time only counts from when the robot got
+    clean, which is the only interval that could contain a real flight.
+    """
+    _hop_state(env)
+    return torch.clamp(env._hop_clean_time - _HOP_CLEAN_LIFTOFF_S, min=0.0)
+
+
+def _hop_is_clean(env: ManagerBasedRlEnv) -> torch.Tensor:
+    """Has the robot been free of non-foot ground contact long enough to hop?"""
+    _hop_state(env)
+    return env._hop_clean_time >= _HOP_CLEAN_LIFTOFF_S
 
 
 def _hop_forward_state(env: ManagerBasedRlEnv) -> tuple:
@@ -7292,19 +7353,20 @@ def _update_hop_accum(env: ManagerBasedRlEnv, sensor_name: str = "feet_ground_co
     the frontier in the same control step don't double-count. The frontier
     only moves forward (max-so-far); landing and re-jumping doesn't erase it.
 
-    TAINT-MASKED (see _update_hop_trunk_taint): a step where the trunk has
-    ever touched the ground this episode contributes zero to the frontier.
+    CLEAN-TIME CAPPED (see _update_hop_clean_time / _hop_clean_air_budget):
+    creditable air time is clamped to how long the robot has been free of
+    non-foot ground contact, so a trunk-assisted liftoff contributes zero.
     This is the single choke point every hop reward routes through (directly
-    or via _hop_completion_gate), so masking here closes the butt-bounce
+    or via _hop_completion_gate), so capping here closes the butt-bounce
     exploit everywhere at once rather than patching each reward term.
     """
     _hop_state(env)
-    _update_hop_trunk_taint(env)
+    _update_hop_clean_time(env)
     step = int(env.common_step_counter)
     if step != env._hop_last_update_step:
         air_time = foot_air_time_safe(env, sensor_name)  # (B, 2): left, right
         both_air = torch.min(air_time[:, 0], air_time[:, 1])
-        both_air = torch.where(env._hop_trunk_touched_ground, torch.zeros_like(both_air), both_air)
+        both_air = torch.minimum(both_air, _hop_clean_air_budget(env))
         env._hop_max_air_time = torch.maximum(env._hop_max_air_time, both_air)
         env._hop_last_update_step = step
 
@@ -7317,7 +7379,7 @@ def _hop_completion_gate(env: ManagerBasedRlEnv, min_air_time: float) -> torch.T
     rest of the episode so landing/recovery rewards keep paying after.
     """
     max_air, _, _ = _hop_state(env)
-    hi = min_air_time * 1.5
+    hi = min_air_time * _HOP_GATE_FULL_OPEN
     t = torch.clamp((max_air - min_air_time) / max(hi - min_air_time, 1e-6), 0.0, 1.0)
     return t * t * (3.0 - 2.0 * t)
 
@@ -7347,8 +7409,19 @@ def reset_hop_state(
 
     Mid-air bucket (the roulade lesson applied here: "the second half is
     learnable on its own"): spawned already airborne with a downward
-    velocity and the air-time frontier PRE-SEEDED past gate_min_air_time, so
-    the landing/recovery gate is open from step 0 of the episode. This
+    velocity and the air-time frontier PRE-SEEDED at
+    ``gate_min_air_time * _HOP_GATE_FULL_OPEN``, so the landing/recovery
+    gate is FULLY open from step 0 of the episode.
+
+    That factor is load-bearing, not a safety margin. Seeding at exactly
+    ``gate_min_air_time`` — which is what this did until 2026-09-13 — puts
+    the frontier on the smoothstep's zero point, so the gate evaluated to
+    0.0000 and all four landing/recovery terms paid nothing for the entire
+    mid-air episode. Nor could the fall make up the difference: from
+    midair_z 0.14-0.18 m against a 0.115 m standing root height, touchdown
+    is 0.02-0.08 s away, so the measured air time rarely even reaches
+    gate_min_air_time, let alone 1.5x it. Half of all training experience
+    was a pure penalty stream. This
     trains "land upright and recover" directly, without requiring liftoff to
     already work. ``midair_vx_range`` samples forward speed (along the
     spawn heading) at spawn too, default off (0,0) — a FORWARD hop lands
@@ -7385,11 +7458,9 @@ def reset_hop_state(
     z_mid = torch.rand(num, device=env.device) * (midair_z_max - midair_z_min) + midair_z_min
     new_z = torch.where(is_mid, z_mid, z_stand)
 
-    # Launch reference for hop_forward_progress: position now (post whatever
-    # default reset already placed it at) and heading just sampled above.
-    # Set for ALL env_ids uniformly — harmless for the mid-air bucket, which
-    # doesn't earn forward-progress credit anyway (no real liftoff to measure
-    # a launch point from).
+    # Defensive default only. The real launch reference is latched at the
+    # moment of liftoff by _update_hop_forward_accum; this just keeps the
+    # buffers meaningful before the first flight of the episode.
     _hop_state(env)
     env._hop_launch_xy[env_ids] = env.sim.data.qpos[env_ids, 0:2].clone()
     env._hop_launch_heading[env_ids] = heading
@@ -7439,12 +7510,15 @@ def reset_hop_state(
     # the frontier past the gate so the landing/recovery reward is live
     # immediately. Standing spawns start at 0 and must earn it.
     seeded = torch.where(
-        is_mid, torch.full_like(z_stand, gate_min_air_time), torch.zeros_like(z_stand)
+        is_mid,
+        torch.full_like(z_stand, gate_min_air_time * _HOP_GATE_FULL_OPEN),
+        torch.zeros_like(z_stand),
     )
     max_air[env_ids] = seeded
     paid[env_ids] = seeded
     completed[env_ids] = is_mid
-    env._hop_trunk_touched_ground[env_ids] = False
+    env._hop_clean_time[env_ids] = 0.0
+    env._hop_in_flight[env_ids] = False
 
 
 def hop_unweighting_bonus(
@@ -7465,16 +7539,16 @@ def hop_unweighting_bonus(
     asset: Entity = env.scene[asset_cfg.name]
     if sensor_name not in env.scene.sensors:
         return torch.zeros(env.num_envs, device=env.device)
-    _update_hop_trunk_taint(env)
+    _update_hop_clean_time(env)
     force = env.scene.sensors[sensor_name].data.force
     force_mag = torch.nan_to_num(force, nan=0.0).norm(dim=-1)
     total_force = force_mag.view(force_mag.shape[0], -1).sum(dim=-1)
     unweighted = torch.clamp(1.0 - total_force / max(force_norm, 1e-6), min=0.0, max=1.0)
     vz = torch.nan_to_num(asset.data.root_link_lin_vel_w[:, 2], nan=0.0)
     bonus = torch.clamp(vz, min=0.0) * unweighted
-    # Taint-masked too: a butt-bounce's rising CoM velocity while its feet
+    # Clean-gated too: a butt-bounce's rising CoM velocity while its feet
     # happen to unweight must not earn the discovery-precursor bonus either.
-    return torch.where(env._hop_trunk_touched_ground, torch.zeros_like(bonus), bonus)
+    return torch.where(_hop_is_clean(env), bonus, torch.zeros_like(bonus))
 
 
 def hop_air_time_progress(
@@ -7503,38 +7577,65 @@ def hop_air_time_progress(
 def _update_hop_forward_accum(env: ManagerBasedRlEnv, sensor_name: str = "feet_ground_contact") -> None:
     """Track the per-episode frontier of forward displacement WHILE airborne.
 
-    Unlike _update_hop_accum (which tracks a DURATION so a single frame of
-    noise doesn't count), this one gates on the INSTANTANEOUS contact state
-    every step: both feet's `found` must read False THIS STEP for that
-    step's displacement to be eligible at all. A shuffle or a walk cycle —
-    which never has both feet off at once — contributes zero on every step,
-    so its frontier never moves, by construction, regardless of how far it
-    travels. Displacement is projected onto the heading recorded at launch
-    (reset_hop_state), since spawn yaw is randomized and this must be
-    "forward relative to the robot", not world +x. The frontier is a
-    max-so-far, like the air-time one: landing and stopping doesn't erase
-    distance already earned this episode.
+    Both feet's `found` must read False THIS STEP, and the robot must be
+    clean of non-foot ground contact (_hop_is_clean), for that step's
+    displacement to be eligible at all.
+
+    The launch reference is LATCHED AT LIFTOFF — the first step of each clean
+    flight — not at episode reset. That distinction is the whole term. Until
+    2026-09-13 this measured displacement from the SPAWN point and merely
+    SAMPLED it on airborne steps, so ground travel accrued silently and was
+    cashed the instant both feet left: lunge forward 8 cm on the feet (which
+    never trips the clean check, since only the feet touch), then stumble
+    through four airborne frames, and the full forward reward paid out. Those
+    same four frames put the air-time frontier near 0.08 s, which also
+    unlocked the landing annuity — so "walk, then trip" collected almost the
+    entire reward stack for far less than a standing broad jump. The
+    docstring claimed a shuffle could not farm this; only a gait that never
+    lifts both feet at once actually couldn't.
+
+    Heading is latched at liftoff too, from the trunk yaw at that instant
+    rather than the spawn yaw, so "forward" means where the robot was facing
+    when it jumped even if it turned first. The frontier is a max-so-far:
+    landing and stopping doesn't erase distance already earned this episode.
     """
     launch_xy, launch_heading, max_fwd, _ = _hop_forward_state(env)
-    _update_hop_trunk_taint(env)
+    _update_hop_clean_time(env)
     step = int(env.common_step_counter)
-    if step != env._hop_last_fwd_update_step:
-        if sensor_name in env.scene.sensors:
-            found = env.scene.sensors[sensor_name].data.found
-            found = found.reshape(found.shape[0], -1)[:, :2]
-            both_air = ~(found[:, 0].bool()) & ~(found[:, 1].bool())
-        else:
-            both_air = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
-        # Taint-masked, same reasoning as _update_hop_accum: a butt-bounce's
-        # airborne moments must not earn forward-distance credit either.
-        both_air = both_air & ~env._hop_trunk_touched_ground
-        asset: Entity = env.scene["robot"]
-        cur_xy = torch.nan_to_num(asset.data.root_link_pos_w[:, :2], nan=0.0)
-        disp = cur_xy - launch_xy
-        forward_disp = torch.clamp((disp * launch_heading).sum(dim=-1), min=0.0)
-        forward_disp = torch.where(both_air, forward_disp, torch.zeros_like(forward_disp))
-        env._hop_max_forward_dist = torch.maximum(max_fwd, forward_disp)
-        env._hop_last_fwd_update_step = step
+    if step == env._hop_last_fwd_update_step:
+        return
+    env._hop_last_fwd_update_step = step
+
+    if sensor_name in env.scene.sensors:
+        found = env.scene.sensors[sensor_name].data.found
+        found = found.reshape(found.shape[0], -1)[:, :2]
+        both_air = ~(found[:, 0].bool()) & ~(found[:, 1].bool())
+    else:
+        both_air = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+    in_flight = both_air & _hop_is_clean(env)
+
+    asset: Entity = env.scene["robot"]
+    cur_xy = torch.nan_to_num(asset.data.root_link_pos_w[:, :2], nan=0.0)
+
+    # Latch the launch frame on the ground -> air transition.
+    lifting_off = in_flight & ~env._hop_in_flight
+    if bool(lifting_off.any()):
+        quat = asset.data.root_link_quat_w
+        w, x, y, z = quat[:, 0], quat[:, 1], quat[:, 2], quat[:, 3]
+        yaw = torch.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+        heading_now = torch.stack([torch.cos(yaw), torch.sin(yaw)], dim=1)
+        env._hop_launch_xy = torch.where(lifting_off.unsqueeze(1), cur_xy, launch_xy)
+        env._hop_launch_heading = torch.where(
+            lifting_off.unsqueeze(1), heading_now, launch_heading
+        )
+        launch_xy = env._hop_launch_xy
+        launch_heading = env._hop_launch_heading
+    env._hop_in_flight = in_flight
+
+    disp = cur_xy - launch_xy
+    forward_disp = torch.clamp((disp * launch_heading).sum(dim=-1), min=0.0)
+    forward_disp = torch.where(in_flight, forward_disp, torch.zeros_like(forward_disp))
+    env._hop_max_forward_dist = torch.maximum(max_fwd, forward_disp)
 
 
 def hop_forward_progress(
@@ -7650,43 +7751,49 @@ def hop_stand_tax(
 
 def hop_no_crawl_penalty(
     env: ManagerBasedRlEnv,
-    sensor_name: str = "trunk_ground_contact",
+    sensor_name: str = "nonfoot_ground_contact",
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
-    """Cost: horizontal trunk speed WHILE the trunk is touching the ground.
+    """Cost: horizontal body speed WHILE a non-foot body touches the ground.
 
     Closes a SECOND exploit found by video review (2026-09-12, "worming"),
-    distinct from the butt-bounce the trunk-taint gate above already
-    closes. standing_composite_score is multiplicative (height × upright ×
-    pose) specifically to prevent a compromise pose from farming partial
-    credit AT A SINGLE INSTANT — but nothing requires the policy to ever
-    STOP MOVING once _hop_completion_gate is open. A policy that drags or
-    undulates its trunk along the ground, rhythmically sweeping close to
-    the target height/upright/pose over and over, can farm nearly as much
-    reward as one that genuinely settles into standing — and ground contact
-    may make that easier to discover than free-standing balance, since it
-    adds stability balance doesn't have. roulade_landing_composite uses the
-    identical standing_composite_score × gate pattern with no equivalent
-    guard, so this was a latent gap there too, not something already solved
-    elsewhere in this file.
+    distinct from the butt-bounce the ground-taint gate above closes.
+    standing_composite_score is multiplicative (height × upright × pose)
+    specifically to prevent a compromise pose from farming partial credit AT
+    A SINGLE INSTANT — but nothing requires the policy to ever STOP MOVING
+    once _hop_completion_gate is open. A policy that drags or undulates
+    along the ground, rhythmically sweeping close to the target
+    height/upright/pose over and over, can farm nearly as much reward as one
+    that genuinely settles into standing — and ground contact may make that
+    easier to discover than free-standing balance, since it adds stability
+    balance doesn't have. roulade_landing_composite uses the identical
+    standing_composite_score × gate pattern with no equivalent guard, so
+    this was a latent gap there too, not something already solved elsewhere
+    in this file.
 
     Deliberately does NOT penalize touching the ground at all — the robot
     has no arms (AGENTS.md joint layout), so briefly bracing or rocking on
-    the trunk to get upright after a bad landing is a legitimate part of
-    "landing badly and recovering" (the same allowance roulade makes for
-    its own recovery phase). Only HORIZONTAL trunk velocity while that
-    contact is happening is taxed — the specific mechanical signature of
-    using ground friction to crawl, not merely touching down. Applies
-    across the whole episode (not gated on _hop_completion_gate): a
-    trunk-drag before liftoff is just as undesirable as one after landing.
+    the hips/beak to get upright after a bad landing is a legitimate part of
+    "landing badly and recovering" (the same allowance roulade makes for its
+    own recovery phase). Only HORIZONTAL velocity while that contact is
+    happening is taxed — the specific mechanical signature of using ground
+    friction to crawl, not merely touching down. Applies across the whole
+    episode (not gated on _hop_completion_gate): a ground-drag before
+    liftoff is just as undesirable as one after landing.
+
+    READS `nonfoot_ground_contact`, NOT a trunk-only sensor. The first
+    version of this read a `trunk_base`-only sensor and was inert — a
+    belly-down robot rests on hips and beak, never on trunk_base, so the
+    term read exactly 0.0000 for an entire 4000-iteration run while the
+    video showed the robot prone the whole time. If this term ever reads a
+    flat zero again, suspect the sensor's body set before the weight.
 
     Returns ≥ 0 (ordinary cost, unlike the self-negating *_tax functions
-    above) — use a NEGATIVE weight. UNVERIFIED like the rest of this file's
-    constants: no GPU in the sandbox that wrote this to measure a real
-    worm's trunk speed, so the weight schedule is a guess, ramped in via
-    curriculum (same reasoning as gentle_landing/torque_rate: an attempt-tax
-    active during discovery risks blocking recovery entirely for a
-    no-armed robot, so it only firms up once SOME landing strategy exists).
+    above) — use a NEGATIVE weight. The weight schedule remains UNVERIFIED
+    (no measurement of a real worm's drag speed), ramped in via curriculum
+    (same reasoning as gentle_landing/torque_rate: an attempt-tax active
+    during discovery risks blocking recovery entirely for a no-armed robot,
+    so it only firms up once SOME landing strategy exists).
     """
     asset: Entity = env.scene[asset_cfg.name]
     if sensor_name not in env.scene.sensors:
