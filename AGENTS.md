@@ -10,11 +10,12 @@ policy that worked in the viewer and failed on hardware.
 
 ## Work in progress — read this first
 
-Branch `feat/hop-env-training`: the forward-hop env (`Mjlab-Hop-MicroDuck`) is mid-recovery
+Branch `feat/hop-env-training`: the forward-hop env (`Mjlab-Hop-Flat-MicroDuck`) is mid-recovery
 after two failed runs. **The active plan is `.claude/plans/microduck-forward-hop.md`** — it is
-untracked, so it will not show up in a file listing; open it directly before touching the hop.
+tracked (committed in `d32a47c`), but it lives outside `docs/`; open it directly before touching
+the hop.
 
-State as of 2026-09-13: four structural defects fixed in the working tree (mid-air gate seeded
+State as of 2026-09-13: four structural defects fixed and committed in `b0e3f63` (mid-air gate seeded
 on its own zero point; a sticky ground taint that made "do nothing" the argmax for most of each
 episode; forward credit measured from the spawn point instead of from liftoff; an unmeasured
 `UNWEIGHT_FORCE_N`). A fifth is open and is task 1 of the plan: the mid-air spawn ranges imply

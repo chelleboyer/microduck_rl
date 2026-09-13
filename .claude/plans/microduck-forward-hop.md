@@ -375,7 +375,7 @@ Execute in order. Each task is atomic and independently testable.
 
 ### RUN the smoke test — MANDATORY GATE
 
-- **IMPLEMENT**: `uv run train Mjlab-Hop-MicroDuck --env.scene.num-envs 64
+- **IMPLEMENT**: `uv run train Mjlab-Hop-Flat-MicroDuck --env.scene.num-envs 64
   --agent.max_iterations 5 --hf-jobs`
 - **WHY**: AGENTS.md — "A 5-iteration smoke test at 64 envs catches ~95% of config errors for cents.
   Never launch a long run without one." This env has never had one; it is where tensor-shape and
@@ -386,7 +386,7 @@ Execute in order. Each task is atomic and independently testable.
 
 ### RUN 3 — probe, 1000 iterations at 4096 envs
 
-- **IMPLEMENT**: `uv run train Mjlab-Hop-MicroDuck --env.scene.num-envs 4096
+- **IMPLEMENT**: `uv run train Mjlab-Hop-Flat-MicroDuck --env.scene.num-envs 4096
   --agent.max_iterations 1000 --hf-jobs`
 - **WHY 1000, NOT 6000**: AGENTS.md budgets simple episodic tricks at ≈1000 iterations at 4096 envs.
   The question run 3 asks — "is liftoff discoverable at all under fixed rewards and measured
@@ -504,15 +504,15 @@ uv run --with pytest pytest tests/ -q     # baseline at plan time: 221 passed, 1
 uv run scripts/measure_hop.py settle
 uv run scripts/measure_hop.py heights
 uv run scripts/measure_hop.py pushoff
-uv run train Mjlab-Hop-MicroDuck --env.scene.num-envs 64 --agent.max_iterations 5 --hf-jobs
+uv run train Mjlab-Hop-Flat-MicroDuck --env.scene.num-envs 64 --agent.max_iterations 5 --hf-jobs
 ```
 
 ### Level 5: Training + Eval
 
 ```bash
-uv run train Mjlab-Hop-MicroDuck --env.scene.num-envs 4096 --agent.max_iterations 1000 --hf-jobs
+uv run train Mjlab-Hop-Flat-MicroDuck --env.scene.num-envs 4096 --agent.max_iterations 1000 --hf-jobs
 uv run scripts/eval_hop.py --wandb-run-path <entity/mjlab_microduck/run_id> --checkpoint 1000
-uv run scripts/export.py Mjlab-Hop-MicroDuck --wandb-run-path <...>
+uv run scripts/export.py Mjlab-Hop-Flat-MicroDuck --wandb-run-path <...>
 uv run scripts/infer_policy.py --walking out.onnx        # CPU deployment rehearsal
 ```
 
