@@ -39,3 +39,22 @@ Named rather than quietly absent.
 | Journeys describe `develop`, not the hop branch | The hop env and `scripts/measure_hop.py` live on `feat/hop-env-training`. They join the journeys when that branch merges | expected |
 | The factory holds a token that can merge, and a shell that could type a train command | `.factory/policy.py` refuses both, and `MISSION.md` forbids them, but neither is a sandbox. The guarantee is a human | **accepted, permanently** |
 | Upstream changed the all-collisions model | `name_servo_collision_geoms` (upstream `cb70b79`) names servo housing geoms, and `FULL_COLLISION` keys condim off names — so those geoms moved from default to condim 1, frictionless. The hop path uses the groundcontact model and is unaffected, but the reference policy `ThomasBurgess2000/microduck-max-height-jump` trains on all-collisions, so its verified numbers predate this change | **open** — matters when porting from it |
+| `--base` sets the worktree cut-from but **not the PR base** | Measured on run `24fea969` (issue #3): dispatched with `--base feat/hop-env-training`, the worktree was cut correctly but the PR opened against `develop` carrying **19 commits, +4,844 lines** — the whole in-flight hop branch. Merging it would have dumped mid-recovery work onto the default branch. The CLI documents `--base` as "per-dispatch PR base + worktree cut-from override"; only the second half held | **open** — check the PR base before reading anything else |
+| Retargeting a PR needs the REST API | `gh pr edit --base` fails with a GraphQL deprecation on `repository.pullRequest.projectCards`. `gh api -X PATCH repos/OWNER/REPO/pulls/N -f base=BRANCH` works | workaround |
+| A PR merged into a feature branch does not close its issue | GitHub honours `Closes #N` only on a merge to the **default** branch. On stacked work — which is every hop ticket — the issue stays open after the work lands, so the factory's own state machine reads "not done". Close by hand, or the backlog lies | **open** |
+| The PR node omitted the issue link entirely | PR #7 contained no `Closes`/`Fixes`/`Resolves` line, and its title described the whole branch rather than the change, because it was written while the PR was still mis-based. Retargeting fixed the diff; the prose is permanent in history | **open** |
+| `gh` had no default repo, and two remotes | `ci-probe` failed with "no pull requests found for branch" — `gh pr list` searched an ambiguous context. Fixed with `gh repo set-default chelleboyer/microduck_rl`, which is **machine-local config, not in the repo**, so a fresh clone or another machine reproduces it | fixed here, unfixed anywhere else |
+| No CI exists in this repository | There is no `.github/workflows`, so `await-checks` waits for checks that will never arrive. Any workflow whose tail depends on CI state fails at that node regardless of the code | **open** |
+
+## Tracked factory improvements
+
+Not done, deliberately, and recorded so they are not rediscovered.
+
+**Narrow the `AGENTS.md` protection.** `FACTORY_RULES.md` lists `AGENTS.md` as a protected
+path, and PR #7 edited it anyway — correctly, as it happens: the edit was the fix issue #4
+asks for. The file is both constitution and live state. Its "Work in progress" block rots
+unless whoever changes the code updates it, which is precisely why issue #4 exists, so
+protecting the whole file guarantees the staleness it is meant to prevent. The likely shape
+is protecting the constitutional sections and leaving the state block writable. Deferred by
+decision on 2026-09-14; until then the rule stands as written and an edit to that file is a
+finding, not a convention.
