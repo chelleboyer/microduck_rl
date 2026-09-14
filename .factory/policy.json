@@ -1,0 +1,42 @@
+{
+  "_what_this_is": "Human-owned invocation policy for microduck_rl. Two gates: the factory never merges, and the factory never spends money on a GPU. .factory/policy.py enforces both against a proposed workflow invocation, a proposed shell command, or a schedule file. Protected: only a human commit changes it.",
+
+  "_the_money_gate": "There is no local CUDA device, so every training run goes through Hugging Face Jobs at the l4x1 flavor and bills a real card. `uv run train` is the launcher and `--hf-jobs` is the flag that makes it remote. AGENTS.md also requires a 64-env/5-iteration smoke test before any long run -- that smoke test is itself a training run and is also a human act. MISSION.md hard invariant 1: the factory may prepare a run, argue for it, and write down exactly what to type. A person types it.",
+
+  "_the_merge_gate": "archon-merge-queue ends in `merge-approved-prs`, which runs gh with the repository owner's token; `approve` mode still has the factory perform the merge. Both are refused here, as in the duckfactory installation.",
+
+  "forbidden_workflows": [
+    "archon-merge-queue",
+    "archon-deploy"
+  ],
+
+  "required_inputs": {
+    "archon-lifecycle": {
+      "merge_mode": "preview",
+      "discoveries_mode": "preview",
+      "deploy": "",
+      "health": "",
+      "identity": ""
+    }
+  },
+
+  "forbidden_input_values": {
+    "merge_mode": ["auto", "approve"],
+    "discoveries_mode": ["auto"],
+    "publication": ["auto"]
+  },
+
+  "forbidden_command_patterns": [
+    "--hf-jobs",
+    "uv run train",
+    "uv run play",
+    "uv run publish",
+    "hf_jobs.submit",
+    "huggingface_hub.run_job",
+    "jobs.run"
+  ],
+  "_command_pattern_note": "Substring matches against a proposed shell command. `uv run train` is the launcher even without --hf-jobs -- a local run would still need a GPU this machine does not have, and a smoke test is a training run. `uv run play` and `uv run publish` are here for a different reason: play needs a trained checkpoint and publish pushes a policy to the Hub where the robot daemon loads it. Neither is destructive on its own; both are outside what the factory does.",
+
+  "standard_path": "archon-ship",
+  "_standard_path_note": "Issue to reviewed pull request. Everything this factory does happens before a merge and before a GPU."
+}

@@ -44,3 +44,16 @@ logdir/.claude/worktrees/
 
 # Machine-local Claude Code permissions — personal, not shared with the repo
 .claude/settings.local.json
+*.pyc
+*.pyo
+.factory/consumer.json
+.factory/retired/
+.factory/STOP
+harness/.results/
+.factory/holdout/.results/
+.env
+.env.*
+!.env.example
+*.pem
+secrets.json
+credentials.json
