@@ -7681,26 +7681,32 @@ def reset_hop_state(
     to get into one.
 
     Mid-air bucket (the roulade lesson applied here: "the second half is
-    learnable on its own"): spawned already airborne with a downward
-    velocity and the air-time frontier PRE-SEEDED at
-    ``gate_min_air_time * _HOP_GATE_FULL_OPEN``, so the landing/recovery
-    gate is FULLY open from step 0 of the episode.
+    learnable on its own"): spawned already airborne, with the air-time
+    frontier PRE-SEEDED at ``gate_min_air_time * _HOP_GATE_FULL_OPEN`` so
+    the landing/recovery gate is FULLY open from step 0 of the episode.
 
     That factor is load-bearing, not a safety margin. Seeding at exactly
     ``gate_min_air_time`` — which is what this did until 2026-09-13 — puts
     the frontier on the smoothstep's zero point, so the gate evaluated to
     0.0000 and all four landing/recovery terms paid nothing for the entire
-    mid-air episode. Nor could the fall make up the difference: from
-    midair_z 0.14-0.18 m against a 0.115 m standing root height, touchdown
-    is 0.02-0.08 s away, so the measured air time rarely even reaches
-    gate_min_air_time, let alone 1.5x it. Half of all training experience
-    was a pure penalty stream. This
-    trains "land upright and recover" directly, without requiring liftoff to
-    already work. ``midair_vx_range`` samples forward speed (along the
-    spawn heading) at spawn too, default off (0,0) — a FORWARD hop lands
-    with real horizontal momentum, so the reverse curriculum must practice
-    recovery under that momentum or it solves an easier problem (landing
-    dead-stopped) that doesn't transfer to the real hop.
+    mid-air episode. Nor can the fall make up the difference, whatever the
+    spawn height: ``_hop_clean_air_budget`` caps creditable air time at
+    ``clean_time - _HOP_CLEAN_LIFTOFF_S``, and this function resets
+    ``_hop_clean_time`` to 0, so a spawned flight (a tenth of a second at
+    most) contributes exactly zero to the frontier by design. Without the
+    seed, half of all training experience is a pure penalty stream.
+
+    The caller supplies ``midair_z_*`` / ``midair_vz_range`` derived from
+    the target hop's ballistics rather than chosen — see the "Mid-air spawn"
+    section of microduck_hop_env_cfg.py. It spawns at the APEX (vz = 0) and
+    lets the simulator produce the descent, so the touchdown is the target
+    hop's touchdown by construction; the ranges in this signature are
+    inert defaults kept for callers that pass nothing, not a recommendation.
+    ``midair_vx_range`` samples forward speed (along the spawn heading) at
+    spawn too, default off (0,0) — a FORWARD hop lands with real horizontal
+    momentum, so the reverse curriculum must practice recovery under that
+    momentum or it solves an easier problem (landing dead-stopped) that
+    doesn't transfer to the real hop.
     """
     if env_ids is None or len(env_ids) == 0:
         return

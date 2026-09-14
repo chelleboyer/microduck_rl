@@ -22,8 +22,12 @@ State as of 2026-09-14:
   liftoff; an unmeasured `UNWEIGHT_FORCE_N`. The fifth — mid-air spawn ranges ballistically
   inconsistent with the target hop — is closed: `MIDAIR_Z_MIN/MAX`, `MIDAIR_VZ_RANGE` and
   `MIDAIR_VX_RANGE` in `microduck_hop_env_cfg.py` are now derived from `TARGET_AIR_TIME`,
-  `STAND_Z` and `TARGET_FORWARD_DIST` instead of pasted guesses, locked by
-  `test_hop_midair_spawn_ballistically_consistent_with_target_air_time`.
+  `STAND_Z` and `TARGET_FORWARD_DIST` instead of pasted guesses. The bucket spawns at the
+  APEX of a target hop (vz = 0) and the simulator produces the descent, so the touchdown is
+  the target hop's touchdown by construction — pairing a sampled apex HEIGHT with a sampled
+  touchdown SPEED is the same defect in a second costume, and
+  `test_hop_midair_spawn_ballistically_consistent_with_target_air_time` fails every corner
+  of the rectangle that is not a state a real hop passes through.
 - Phase 1 (measurement) is DONE. `scripts/measure_hop.py` is the CPU harness: `settle`,
   `heights`, `pushoff`, `ranges`. Measured `STAND_Z` = **0.1172 m** (the cfg's inherited 0.115 is
   2.2 mm low); full extension is 0.1408 m, so HOME is already a ~24 mm crouched stand.
@@ -36,7 +40,7 @@ State as of 2026-09-14:
 - `AMENDMENT 1`'s four ports — a crouch spawn bucket, a launch-velocity reward, an airborne
   attitude penalty, and a `cfg.metrics` block — are implemented (`17f5e63`). All five structural
   defects are now closed; the rest of the plan's Phase 2 (AC #3: reducing run 3 to one question)
-  is still open. Suite green at 265.
+  is still open. Suite green at 266.
 
 **Prior art worth reading before touching the hop:** the community policy
 `ThomasBurgess2000/microduck-max-height-jump` (GitHub) trains `Mjlab-Jump-Flat-MicroDuck` on the
