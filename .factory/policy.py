@@ -65,8 +65,9 @@ def parse_inputs(argv: list[str]) -> dict[str, str]:
 # assuming otherwise is how `run --detach archon-merge-queue` hid a forbidden
 # workflow behind a flag -- caught by this file's own selftest, which is the
 # entire argument for the selftest existing.
-VALUE_FLAGS = {"--input", "--adopt", "--config", "--model", "--branch",
-               "--workflow-source", "--reason", "--comment", "--cwd"}
+VALUE_FLAGS = {"--input", "--adopt", "--config", "--model", "--branch", "--base",
+               "--workflow-source", "--reason", "--comment", "--cwd", "--runtime-host",
+               "--flavor", "--timeout", "--namespace"}
 
 
 def workflow_of(argv: list[str]) -> str | None:
@@ -177,7 +178,13 @@ CASES: list[tuple[list[str], bool, str]] = [
       "--input", "health=", "--input", "identity="], True,
      "lifecycle in full preview is allowed"),
     (["run", "--detach", "archon-merge-queue"], False,
-     "a flag before the workflow name does not hide it"),
+     "a boolean flag before the workflow name does not hide it"),
+    (["run", "--base", "feat/hop-env-training", "archon-merge-queue"], False,
+     "a VALUE-taking flag before the workflow name does not hide it either -- the "
+     "branch name must not be mistaken for the workflow"),
+    (["run", "--base", "feat/hop-env-training", "archon-ship",
+      "--input", "target=https://x/issues/3"], True,
+     "the standard path with an explicit base is allowed"),
     (["run", "archon-backlog", "--input=publication=auto"], False,
      "the --input=k=v spelling is parsed too"),
 ]
