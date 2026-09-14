@@ -109,8 +109,10 @@ that.
 UNVERIFIED, run 1 — PARTLY SUPERSEDED by the measurement pass recorded in
 `.claude/plans/microduck-forward-hop.md` (Phase 1) and by course correction 4
 above: STAND_Z, the mid-air spawn ranges and TARGET_AIR_TIME each now have a
-measured or verified answer that has NOT yet been applied to the constants
-below. Still true as written for EPISODE_LENGTH_S. Every numeric constant
+measured or verified answer. STAND_Z has been applied (see below); the
+mid-air spawn ranges and TARGET_AIR_TIME still have a measured/verified
+answer that has NOT yet been applied to the constants below. Still true as
+written for EPISODE_LENGTH_S. Every numeric constant
 below (EPISODE_LENGTH_S, air-time targets, mid-air spawn ranges, force_norm)
 is a plausible guess, not a sim measurement — this sandbox has no GPU to run mjlab's MuJoCo-Warp step, so
 AGENTS.md step 2 ("verify physics assumptions in sim BEFORE training") could
@@ -160,9 +162,11 @@ IMU_ORIENTATION_RANDOMIZATION_ANGLE = 6.0
 # hop has no rotation to get through.
 EPISODE_LENGTH_S = 3.0
 
-# Measured standing trunk height, reused from the roulade/standup envs
-# (same robot model, same standing pose) — not re-measured here.
-STAND_Z = 0.115
+# Measured standing trunk height for this compiled model (robot_groundcontact.xml):
+# `uv run scripts/measure_hop.py heights`, 2026-09-13 (Amendment 1,
+# .claude/plans/microduck-forward-hop.md). Supersedes the 0.115 pasted over from
+# roulade/standup, which was 2.2 mm off this model's actual settled height.
+STAND_Z = 0.1172
 
 # Every robot body EXCEPT the two ankles (which own left/right_foot_collision,
 # the only geoms allowed to touch the ground). Used by nonfoot_ground_cfg —

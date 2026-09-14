@@ -70,6 +70,35 @@ def test_hop_landing_target_height_matches_standing():
     cfg = make_microduck_hop_env_cfg()
     assert cfg.rewards["hop_landing_composite"].params["target_height"] == STAND_Z
     assert cfg.rewards["hop_stand_tax"].params["target_height"] == STAND_Z
+    assert cfg.rewards["hop_height_after_landing"].params["target_height"] == STAND_Z
+    assert cfg.metrics["stable_landing_rate"].params["target_height"] == STAND_Z
+
+
+def test_hop_stand_z_matches_measured_kinematic_height():
+    """Regression for the 2.2 mm drift documented in
+    .claude/plans/microduck-forward-hop.md Amendment 1: STAND_Z was pasted
+    over from the roulade/standup envs (0.115) instead of measured for this
+    model's HOME pose. Reuses measure_hop.py's own exact-kinematics helpers
+    (the `heights` subcommand's code path) so the cfg constant and the
+    measurement it claims to be cannot silently diverge again.
+    """
+    import importlib.util
+    from pathlib import Path
+
+    repo = Path(__file__).resolve().parents[1]
+    spec = importlib.util.spec_from_file_location(
+        "measure_hop", repo / "scripts" / "measure_hop.py"
+    )
+    mh = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mh)
+
+    model, data, _bam_ctrl, names = mh._build(vin=8.2)
+    floor_gid, _feet_gids = mh._geom_ids(model)
+    robot_geoms = mh._robot_collision_geoms(model, floor_gid)
+    home = mh._home_ctrl(names)
+    z_home = mh._kinematic_trunk_z(model, data, home, floor_gid, robot_geoms)
+
+    assert z_home == pytest.approx(STAND_Z, abs=1e-3)
 
 
 def test_hop_no_fell_over_termination():
