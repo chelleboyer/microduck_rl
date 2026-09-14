@@ -160,9 +160,11 @@ IMU_ORIENTATION_RANDOMIZATION_ANGLE = 6.0
 # hop has no rotation to get through.
 EPISODE_LENGTH_S = 3.0
 
-# Measured standing trunk height, reused from the roulade/standup envs
-# (same robot model, same standing pose) — not re-measured here.
-STAND_Z = 0.115
+# Measured standing trunk height for this compiled model (robot_groundcontact.xml):
+# `uv run scripts/measure_hop.py heights`, 2026-09-13 (Amendment 1,
+# .claude/plans/microduck-forward-hop.md). Supersedes the 0.115 pasted over from
+# roulade/standup, which was 2.2 mm off this model's actual settled height.
+STAND_Z = 0.1172
 
 # Every robot body EXCEPT the two ankles (which own left/right_foot_collision,
 # the only geoms allowed to touch the ground). Used by nonfoot_ground_cfg —
