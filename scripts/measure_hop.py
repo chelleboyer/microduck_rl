@@ -62,6 +62,8 @@ from pathlib import Path
 import mujoco
 import numpy as np
 
+from mjlab_microduck.tasks.microduck_hop_env_cfg import STAND_Z as HOP_CFG_STAND_Z
+
 REPO = Path(__file__).resolve().parents[1]
 
 # scene.xml = robot_groundcontact.xml (exactly what MICRODUCK_STANDUP_ROBOT_CFG
@@ -434,7 +436,8 @@ def cmd_heights(args):
 
     print(f"\nHOME / STAND2 pose (p={home_p:.4f}, q={home_q:.4f}):")
     print(f"  kinematic trunk z .............. {z_home:.4f} m")
-    print(f"  hop cfg STAND_Z = 0.1150 m ..... delta {1000*(z_home-0.115):+.1f} mm")
+    print(f"  hop cfg STAND_Z = {HOP_CFG_STAND_Z:.4f} m ..... "
+          f"delta {1000*(z_home-HOP_CFG_STAND_Z):+.1f} mm")
     print(f"\nfull extension (p={p_ext:+.2f}, q={q_ext:+.2f}): z = {z_ext:.4f} m")
     print(f"deepest crouch (p={p_cr:+.2f}, q={q_cr:+.2f}): z = {z_cr:.4f} m")
     print(f"\ntotal kinematic stroke ............ {1000*(z_ext - z_cr):.1f} mm")
@@ -747,7 +750,10 @@ def main(argv=None):
                    help="stroke [m] used for the force-requirement table")
     h.set_defaults(func=cmd_heights)
 
-    p = sub.add_parser("pushoff", help="THE GATING MEASUREMENT: achievable air time")
+    p = sub.add_parser(
+        "pushoff",
+        help="open-loop push-off sweep (a floor, not a ceiling — see CEILING CAVEAT)",
+    )
     p.add_argument("--vin-sweep", type=float, nargs="+", default=[6.5, 8.2])
     p.add_argument("--crouch-step", type=float, default=0.2,
                    help="knee-angle step [rad] between crouch depths")
@@ -764,7 +770,7 @@ def main(argv=None):
 
     r = sub.add_parser("ranges", help="derive mid-air spawn constants from an air time")
     r.add_argument("--air-time", type=float, required=True)
-    r.add_argument("--stand-z", type=float, default=0.115)
+    r.add_argument("--stand-z", type=float, default=HOP_CFG_STAND_Z)
     r.add_argument("--forward-dist", type=float, default=0.05)
     r.add_argument("--spread", type=float, default=1.33)
     r.set_defaults(func=cmd_ranges)

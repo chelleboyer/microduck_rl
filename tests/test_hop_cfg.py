@@ -70,6 +70,8 @@ def test_hop_landing_target_height_matches_standing():
     cfg = make_microduck_hop_env_cfg()
     assert cfg.rewards["hop_landing_composite"].params["target_height"] == STAND_Z
     assert cfg.rewards["hop_stand_tax"].params["target_height"] == STAND_Z
+    assert cfg.rewards["hop_height_after_landing"].params["target_height"] == STAND_Z
+    assert cfg.metrics["stable_landing_rate"].params["target_height"] == STAND_Z
 
 
 def test_hop_stand_z_matches_measured_kinematic_height():

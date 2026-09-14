@@ -30,9 +30,10 @@ State as of 2026-09-13:
 - `TARGET_AIR_TIME = 0.15 s` **is achievable** — see the jump-policy reference below. Do not
   size it down from `measure_hop.py pushoff`, which bounds hand-designed open-loop profiles, not
   the robot. That script carries a CEILING CAVEAT saying so; heed it.
-- Next work is `AMENDMENT 1`'s four ports: a crouch spawn bucket, a launch-velocity reward, an
-  airborne attitude penalty, and a `cfg.metrics` block. None are implemented. All are
-  CPU-testable up to the smoke test. Suite green at 221.
+- `AMENDMENT 1`'s four ports — a crouch spawn bucket, a launch-velocity reward, an airborne
+  attitude penalty, and a `cfg.metrics` block — are implemented (`17f5e63`). Next work is the
+  still-open fifth defect: mid-air spawn ranges ballistically inconsistent with the target hop.
+  Suite green at 264.
 
 **Prior art worth reading before touching the hop:** the community policy
 `ThomasBurgess2000/microduck-max-height-jump` (GitHub) trains `Mjlab-Jump-Flat-MicroDuck` on the
