@@ -110,9 +110,10 @@ UNVERIFIED, run 1 — PARTLY SUPERSEDED by the measurement pass recorded in
 `.claude/plans/microduck-forward-hop.md` (Phase 1) and by course correction 4
 above: STAND_Z, the mid-air spawn ranges and TARGET_AIR_TIME each now have a
 measured or verified answer. STAND_Z has been applied (see below); the
-mid-air spawn ranges and TARGET_AIR_TIME still have a measured/verified
-answer that has NOT yet been applied to the constants below. Still true as
-written for EPISODE_LENGTH_S. Every numeric constant
+mid-air spawn ranges are now derived from TARGET_AIR_TIME/STAND_Z/
+TARGET_FORWARD_DIST (see the "Mid-air spawn" section below — structural
+defect #5, closed 2026-09-14). Still true as written for EPISODE_LENGTH_S.
+Every numeric constant
 below (EPISODE_LENGTH_S, air-time targets, mid-air spawn ranges, force_norm)
 is a plausible guess, not a sim measurement — this sandbox has no GPU to run mjlab's MuJoCo-Warp step, so
 AGENTS.md step 2 ("verify physics assumptions in sim BEFORE training") could
@@ -187,13 +188,28 @@ TARGET_FORWARD_DIST = 0.05  # m of forward travel FROM LIFTOFF that earns full c
                              # Raise it once a run has produced a hop worth measuring.
 
 # ── Mid-air spawn (reverse curriculum) ───────────────────────────────────────
-MIDAIR_Z_MIN  = 0.14
-MIDAIR_Z_MAX  = 0.18
-MIDAIR_VZ_RANGE = (-1.5, -0.5)   # falling, UNVERIFIED — measure a real hop's descent speed
-MIDAIR_VX_RANGE = (0.0, 0.6)     # forward speed at landing, UNVERIFIED — a forward hop lands
-                                  # with real horizontal momentum; without this the
-                                  # landing/recovery half of the reverse curriculum only ever
-                                  # practices a dead-stop landing and won't transfer
+# Derived from the target hop's own ballistics (structural defect #5, closed
+# 2026-09-14) instead of pasted guesses. A hop of simultaneous air time T
+# rises g*T^2/8 above its launch height, touches down descending at g*T/2,
+# and covers TARGET_FORWARD_DIST/T forward. Sweeping T over the same band
+# hop_air_time_progress pays full credit over (+/-33% of TARGET_AIR_TIME)
+# keeps the reverse-curriculum landing bucket practising touchdowns the
+# target hop can actually produce, instead of a landing profile (faster,
+# higher, ~2x the horizontal speed) the target hop never produces. A forward
+# hop lands with real horizontal momentum, so MIDAIR_VX_RANGE has no zero —
+# without it the landing/recovery half of the reverse curriculum only ever
+# practices a dead-stop landing and won't transfer.
+_MIDAIR_T_MIN = 0.67 * TARGET_AIR_TIME
+_MIDAIR_T_MAX = 1.33 * TARGET_AIR_TIME
+_G = 9.81  # m/s^2
+
+MIDAIR_Z_MIN = STAND_Z + _G * _MIDAIR_T_MIN ** 2 / 8
+MIDAIR_Z_MAX = STAND_Z + _G * _MIDAIR_T_MAX ** 2 / 8
+MIDAIR_VZ_RANGE = (-_G * _MIDAIR_T_MAX / 2, -_G * _MIDAIR_T_MIN / 2)  # falling
+MIDAIR_VX_RANGE = (
+    TARGET_FORWARD_DIST / _MIDAIR_T_MAX,
+    TARGET_FORWARD_DIST / _MIDAIR_T_MIN,
+)  # forward speed at landing
 
 # ── Crouch spawn (reverse curriculum applied to the START of the hop) ────────
 # The loaded pre-push pose. Ported from the verified jump policy, whose leg

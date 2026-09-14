@@ -8,6 +8,9 @@ from mjlab_microduck.tasks.microduck_hop_env_cfg import (
     FOOT_BODIES,
     HOP_MIN_AIR_TIME,
     MIDAIR_VX_RANGE,
+    MIDAIR_VZ_RANGE,
+    MIDAIR_Z_MAX,
+    MIDAIR_Z_MIN,
     NONFOOT_BODY_PATTERN,
     STAND_Z,
     TARGET_AIR_TIME,
@@ -15,6 +18,8 @@ from mjlab_microduck.tasks.microduck_hop_env_cfg import (
     TARGET_FORWARD_DIST,
     make_microduck_hop_env_cfg,
 )
+
+_G = 9.81  # m/s^2
 
 
 def test_hop_cfg_builds():
@@ -135,6 +140,26 @@ def test_hop_midair_spawn_carries_forward_momentum():
     cfg = make_microduck_hop_env_cfg()
     assert cfg.events["set_hop_state"].params["midair_vx_range"] == MIDAIR_VX_RANGE
     assert MIDAIR_VX_RANGE[1] > 0.0
+
+
+def test_hop_midair_spawn_ballistically_consistent_with_target_air_time():
+    """Regression for structural defect #5 (closed 2026-09-14): the mid-air
+    spawn ranges were pasted guesses that implied hops 1.2x-2.6x longer than
+    TARGET_AIR_TIME. Bounds the derived constants against the ballistics of
+    a generously-longer hop (1.4x TARGET_AIR_TIME for the vertical terms,
+    1.5x for the horizontal one, per
+    .claude/plans/microduck-forward-hop.md's AC #2), independently of the
+    cfg module's own derivation, so a future change to TARGET_AIR_TIME that
+    forgets to move these ranges fails here instead of silently drifting.
+    """
+    longer_hop_t = 1.4 * TARGET_AIR_TIME
+    max_apex_rise = _G * longer_hop_t ** 2 / 8
+    max_touchdown_speed = _G * longer_hop_t / 2
+
+    assert MIDAIR_Z_MAX <= STAND_Z + max_apex_rise
+    assert MIDAIR_Z_MIN > STAND_Z  # a mid-air spawn must be airborne, not underground
+    assert abs(MIDAIR_VZ_RANGE[0]) <= max_touchdown_speed
+    assert MIDAIR_VX_RANGE[1] * TARGET_AIR_TIME <= 1.5 * TARGET_FORWARD_DIST
 
 
 def test_hop_ground_sensor_registered():
