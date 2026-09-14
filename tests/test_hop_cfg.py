@@ -8,6 +8,9 @@ from mjlab_microduck.tasks.microduck_hop_env_cfg import (
     FOOT_BODIES,
     HOP_MIN_AIR_TIME,
     MIDAIR_VX_RANGE,
+    MIDAIR_VZ_RANGE,
+    MIDAIR_Z_MAX,
+    MIDAIR_Z_MIN,
     NONFOOT_BODY_PATTERN,
     STAND_Z,
     TARGET_AIR_TIME,
@@ -15,6 +18,8 @@ from mjlab_microduck.tasks.microduck_hop_env_cfg import (
     TARGET_FORWARD_DIST,
     make_microduck_hop_env_cfg,
 )
+
+_G = 9.81  # m/s^2
 
 
 def test_hop_cfg_builds():
@@ -137,6 +142,75 @@ def test_hop_midair_spawn_carries_forward_momentum():
     assert MIDAIR_VX_RANGE[1] > 0.0
 
 
+def test_hop_midair_spawn_ballistically_consistent_with_target_air_time():
+    """Regression for structural defect #5 (closed 2026-09-14).
+
+    The spawn is sampled as an independent rectangle — z from
+    [MIDAIR_Z_MIN, MIDAIR_Z_MAX], vz from MIDAIR_VZ_RANGE, forward speed
+    from MIDAIR_VX_RANGE — so EVERY CORNER of it has to be a state a target
+    hop actually passes through, not just the middle. The superseded
+    constants paired an apex HEIGHT with a touchdown SPEED, which are the
+    two ends of one arc and never the same instant: the corners implied
+    hops up to 1.9x TARGET_AIR_TIME and put the worst one 12 ms (under one
+    control step at 50 Hz) from impact.
+
+    Asserted against the design criterion rather than the cfg's own
+    formula, so this fails on a drift instead of restating it: each corner
+    must imply a hop within +/-50% of TARGET_AIR_TIME, and must leave the
+    policy at least two control steps of flight to prepare in. A future
+    TARGET_AIR_TIME change that forgets these ranges lands here.
+    """
+    ctrl_dt = 1.0 / 50.0  # policies train and deploy at 50 Hz
+    t_lo, t_hi = 0.5 * TARGET_AIR_TIME, 1.5 * TARGET_AIR_TIME
+
+    assert MIDAIR_Z_MIN > STAND_Z  # a mid-air spawn must be airborne, not underground
+    assert MIDAIR_Z_MIN <= MIDAIR_Z_MAX
+    assert MIDAIR_VZ_RANGE[0] <= MIDAIR_VZ_RANGE[1] <= 0.0  # never spawn rising
+
+    for z in (MIDAIR_Z_MIN, MIDAIR_Z_MAX):
+        for vz in MIDAIR_VZ_RANGE:
+            # Energy on the arc: a body at (z, vz) reaches STAND_Z doing
+            # this, and a hop of air time T touches down doing g*T/2.
+            touchdown_speed = math.sqrt(vz ** 2 + 2 * _G * (z - STAND_Z))
+            implied_t = 2 * touchdown_speed / _G
+            assert t_lo <= implied_t <= t_hi, (
+                f"spawn corner z={z:.4f} vz={vz:.3f} touches down at "
+                f"{touchdown_speed:.3f} m/s, i.e. a {implied_t:.3f} s hop, "
+                f"outside {t_lo:.3f}-{t_hi:.3f} s"
+            )
+            flight_left = (touchdown_speed - abs(vz)) / _G
+            assert flight_left >= 2 * ctrl_dt, (
+                f"spawn corner z={z:.4f} vz={vz:.3f} is only "
+                f"{flight_left * 1000:.0f} ms from touchdown — the landing "
+                f"bucket would spawn the policy at the impact, not before it"
+            )
+
+    # Horizontal axis, same criterion: the forward speed carried through the
+    # flight must be TARGET_FORWARD_DIST covered in a hop of plausible length.
+    for vx in MIDAIR_VX_RANGE:
+        assert vx > 0.0  # see test_hop_midair_spawn_carries_forward_momentum
+        implied_t = TARGET_FORWARD_DIST / vx
+        assert t_lo <= implied_t <= t_hi, (
+            f"spawn forward speed {vx:.3f} m/s covers TARGET_FORWARD_DIST in "
+            f"{implied_t:.3f} s, outside {t_lo:.3f}-{t_hi:.3f} s"
+        )
+
+
+def test_hop_midair_spawn_wired_into_the_reset_event():
+    """The derived constants must be what the event actually samples.
+
+    The vertical half of defect #5 is invisible in the cfg module alone: a
+    correct derivation that never reaches set_hop_state leaves the event on
+    reset_hop_state's signature defaults, which ARE the discredited guesses
+    (0.14-0.18 m, -1.5..-0.5 m/s).
+    """
+    cfg = make_microduck_hop_env_cfg()
+    params = cfg.events["set_hop_state"].params
+    assert params["midair_z_min"] == MIDAIR_Z_MIN
+    assert params["midair_z_max"] == MIDAIR_Z_MAX
+    assert params["midair_vz_range"] == MIDAIR_VZ_RANGE
+
+
 def test_hop_ground_sensor_registered():
     """Both ground-cheat fixes (butt-bounce taint, no-crawl penalty) read
     this sensor; without it nothing distinguishes a leg-driven liftoff from
@@ -239,9 +313,11 @@ def test_hop_midair_spawn_opens_the_landing_gate():
     reset_hop_state seeded the air-time frontier at exactly
     gate_min_air_time, which is the smoothstep's ZERO point, so
     hop_landing_composite / _upright / _height / _stand_tax all evaluated to
-    0 for every mid-air episode. The fall itself cannot rescue this — from
-    MIDAIR_Z_MIN..MAX against STAND_Z there is only ~0.02-0.08 s of air
-    before touchdown.
+    0 for every mid-air episode. The fall itself cannot rescue this: the
+    apex spawn gives 0.05-0.10 s of descent, and none of it is creditable
+    anyway — _hop_clean_air_budget only counts air time from
+    _HOP_CLEAN_LIFTOFF_S (0.15 s) of clean contact, and reset_hop_state
+    starts that clock at zero.
     """
     import torch
     from types import SimpleNamespace

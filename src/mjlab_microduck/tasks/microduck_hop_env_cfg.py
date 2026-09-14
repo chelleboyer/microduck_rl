@@ -106,17 +106,28 @@ that.
     does — which is how the inert-sensor bug hid for a full run. Read
     valid_takeoff_rate and max_com_rise_mm FIRST on any run.
 
+Course correction 5 (2026-09-14, pre-run-3): the fifth and last structural
+defect — mid-air spawn ranges ballistically inconsistent with the target hop
+— is closed. The four mid-air constants are no longer free numbers: the
+bucket now spawns at the APEX of a hop of air time T (swept +/-33% around
+TARGET_AIR_TIME) and the simulator produces the descent, so its touchdown is
+the target hop's touchdown by construction. The superseded version paired an
+apex HEIGHT with a touchdown SPEED — two ends of one arc, never the same
+instant — which spawned the robot with twice the target hop's energy and, in
+the worst corner, 12 ms (under one control step) before impact. See the
+"Mid-air spawn" section below for the derivation and the numbers.
+
 UNVERIFIED, run 1 — PARTLY SUPERSEDED by the measurement pass recorded in
-`.claude/plans/microduck-forward-hop.md` (Phase 1) and by course correction 4
-above: STAND_Z, the mid-air spawn ranges and TARGET_AIR_TIME each now have a
-measured or verified answer. STAND_Z has been applied (see below); the
-mid-air spawn ranges and TARGET_AIR_TIME still have a measured/verified
-answer that has NOT yet been applied to the constants below. Still true as
-written for EPISODE_LENGTH_S. Every numeric constant
-below (EPISODE_LENGTH_S, air-time targets, mid-air spawn ranges, force_norm)
-is a plausible guess, not a sim measurement — this sandbox has no GPU to run mjlab's MuJoCo-Warp step, so
-AGENTS.md step 2 ("verify physics assumptions in sim BEFORE training") could
-not be done. The mandatory next step before any real training run is the
+`.claude/plans/microduck-forward-hop.md` (Phase 1) and by course corrections
+4 and 5 above: STAND_Z, the mid-air spawn ranges and TARGET_AIR_TIME each now
+have a measured, verified or derived answer. STAND_Z is measured and applied
+(see below); TARGET_AIR_TIME is verified reachable by the jump policy; the
+mid-air spawn ranges are now DERIVED from those two plus
+TARGET_FORWARD_DIST, so they are exactly as good as their inputs and move
+with them. The rest (EPISODE_LENGTH_S, HOP_MIN_AIR_TIME,
+TARGET_FORWARD_DIST) is still a plausible guess, not a sim measurement —
+this sandbox has no GPU to run mjlab's MuJoCo-Warp step, so AGENTS.md step 2
+("verify physics assumptions in sim BEFORE training") could not be done. The mandatory next step before any real training run is the
 64-env / 5-iteration smoke test, which will need to run somewhere with a
 CUDA device (locally or via --hf-jobs) and will very likely surface
 tensor-shape or physics-assumption bugs this review could not catch.
@@ -187,13 +198,59 @@ TARGET_FORWARD_DIST = 0.05  # m of forward travel FROM LIFTOFF that earns full c
                              # Raise it once a run has produced a hop worth measuring.
 
 # ── Mid-air spawn (reverse curriculum) ───────────────────────────────────────
-MIDAIR_Z_MIN  = 0.14
-MIDAIR_Z_MAX  = 0.18
-MIDAIR_VZ_RANGE = (-1.5, -0.5)   # falling, UNVERIFIED — measure a real hop's descent speed
-MIDAIR_VX_RANGE = (0.0, 0.6)     # forward speed at landing, UNVERIFIED — a forward hop lands
-                                  # with real horizontal momentum; without this the
-                                  # landing/recovery half of the reverse curriculum only ever
-                                  # practices a dead-stop landing and won't transfer
+# Derived from the target hop's own ballistics (structural defect #5, closed
+# 2026-09-14) instead of pasted guesses.
+#
+# The bucket spawns the robot at the APEX of a target hop and lets the
+# simulator produce the descent. A body released at rest from
+# STAND_Z + g*T^2/8 touches down at STAND_Z doing g*T/2 — which IS the landing
+# a hop of simultaneous air time T produces — so the touchdown practised here
+# is exactly the touchdown the policy will have to survive, with nothing left
+# to an independently sampled velocity. Mid-air joints are HOME (plus the
+# event's noise), so trunk-to-sole spacing at touchdown is STAND_Z by
+# construction and the apex rise above STAND_Z is the sole clearance.
+#
+# WHY NOT ALSO SAMPLE vz: the superseded version took z from the apex band and
+# vz from the TOUCHDOWN-speed band, sampled independently. Those are the two
+# ENDS of one arc and never the same instant, so pairing them spawned the
+# robot with twice the target hop's energy: touchdown came at 0.70-1.38 m/s
+# against the 0.49-0.98 m/s the band's own hops reach (up to 1.9x the 0.74 m/s
+# of TARGET_AIR_TIME itself), and in the worst corner only 12 ms — under one
+# control step at 50 Hz — separated the spawn from the impact, so the landing
+# bucket was spawning the policy at the impact rather than before it. An apex
+# spawn hands it the whole descent, 2.5-5.0 control steps, and every
+# intermediate (z, vz) of a real arc is then generated by the simulator
+# instead of sampled off it.
+#
+# T is swept +/-33% around TARGET_AIR_TIME so the bucket practises the short
+# and long hops the policy will actually produce rather than only the nominal
+# one. (hop_air_time_progress saturates AT the target, so a longer hop is
+# worth no more than the target one — the spread buys landing robustness, not
+# reward coverage.)
+#
+# Horizontal speed is the independent axis: a hop covering
+# TARGET_FORWARD_DIST in T carries TARGET_FORWARD_DIST/T of forward speed
+# through the whole flight, apex included. It has no zero — a forward hop
+# lands with real horizontal momentum, and without it the landing/recovery
+# half of the reverse curriculum only ever practices a dead-stop landing and
+# won't transfer.
+#
+# NOT a measurement: TARGET_AIR_TIME, STAND_Z and TARGET_FORWARD_DIST are the
+# inputs, and only STAND_Z is measured. These constants are exactly as good as
+# those, which is the point — they now MOVE with them instead of drifting.
+_MIDAIR_T_MIN = 0.67 * TARGET_AIR_TIME
+_MIDAIR_T_MAX = 1.33 * TARGET_AIR_TIME
+_G = 9.81  # m/s^2
+
+# Apex of the shortest and the longest practised hop.
+MIDAIR_Z_MIN = STAND_Z + _G * _MIDAIR_T_MIN ** 2 / 8
+MIDAIR_Z_MAX = STAND_Z + _G * _MIDAIR_T_MAX ** 2 / 8
+# At the apex, by definition. The descent is simulated, not sampled.
+MIDAIR_VZ_RANGE = (0.0, 0.0)
+MIDAIR_VX_RANGE = (
+    TARGET_FORWARD_DIST / _MIDAIR_T_MAX,
+    TARGET_FORWARD_DIST / _MIDAIR_T_MIN,
+)  # forward speed, held through the flight
 
 # ── Crouch spawn (reverse curriculum applied to the START of the hop) ────────
 # The loaded pre-push pose. Ported from the verified jump policy, whose leg
