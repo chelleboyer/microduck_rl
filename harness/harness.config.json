@@ -1,0 +1,24 @@
+{
+  "static": "",
+  "_static_is_empty_on_purpose": [
+    "This repository has no lint gate today. `[tool.ruff]` in pyproject.toml sets only",
+    "src, indent-width and exclude -- no rule selection -- and AGENTS.md's Commands",
+    "section names no lint command at all. Measured on develop 2026-09-14:",
+    "`ruff check .` reports 452 errors under ruff's default rules (tasks 106, tests 34,",
+    "scripts 49). Declaring that as the static rung would leave the gate red before the",
+    "first lap, so nothing could merge -- including the change that would make it pass.",
+    "",
+    "Left empty, ci.py prints STATIC_SKIPPED, which is loud and true. Adopting a lint",
+    "gate is real work with a real triage cost and belongs in its own ticket."
+  ],
+
+  "unit": "uv run --with pytest pytest tests/ -q",
+  "unit_count_pattern": "(\\d+) passed",
+  "_unit_note": [
+    "CPU-only and needs no GPU: 225 passed, 1 skipped in ~40s on develop (2026-09-14),",
+    "237 passed on feat/hop-env-training. The count is evidence, not a threshold --",
+    "see FACTORY_RULES.md. ci.py still fails on a suite that discovers zero tests."
+  ],
+
+  "description": "Ordinary project checks only. Training is never a check: it costs money and is human-launched. See .factory/policy.json."
+}
