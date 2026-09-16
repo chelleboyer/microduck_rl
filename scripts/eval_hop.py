@@ -197,6 +197,14 @@ def _run_wave(env: ManagerBasedRlEnv, wrapped: RslRlVecEnvWrapper, policy, wave_
     next ``wrapped.step()`` otherwise raises for the whole batch. This loop
     does that after each step, before the next one is taken.
 
+    Every quantity this wave reports is snapshotted immediately BEFORE the
+    reset that ends each env's episode, never after the loop: mjlab's
+    ``time_out`` term fires for every env on the final step, and the reset it
+    triggers zeroes the MDP accumulators and respawns the robot. Reading after
+    the loop would report the replacement spawn for every episode -- an
+    acceptance rate of 0% for any policy, indistinguishable from a real
+    failure. See the snapshot block below.
+
     Must be called from inside the caller's own ``torch.inference_mode()``
     span (``run_battery`` opens one around its whole multi-wave loop). A
     span scoped to just this function would promote tensors reassigned
@@ -218,6 +226,48 @@ def _run_wave(env: ManagerBasedRlEnv, wrapped: RslRlVecEnvWrapper, policy, wave_
     landing_tilt_deg = torch.full((num_envs,), float("nan"), device=device)
     landing_both_feet = torch.zeros(num_envs, dtype=torch.bool, device=device)
     landing_recorded = torch.zeros(num_envs, dtype=torch.bool, device=device)
+
+    # Per-slot snapshot of the episode this wave is actually measuring.
+    #
+    # Every env in a wave ends its episode with a reset: `nan_state` mid-wave,
+    # or mjlab's `time_out` term on the final step, which fires for EVERY env
+    # once `episode_length_buf >= max_episode_length` (mjlab
+    # envs/mdp/terminations.py) and lands in `reset_buf`
+    # (managers/termination_manager.py -- `truncated | terminated`). Resetting
+    # zeroes both the MDP accumulators (`_hop_max_air_time`,
+    # `_hop_max_forward_dist`, via the `reset_hop_state` event) and this loop's
+    # own bookkeeping, and it respawns the robot -- so reading any of those
+    # AFTER the loop reports the freshly-spawned replacement, not the episode
+    # that was measured. Snapshotting immediately BEFORE each reset is what
+    # makes the final episode's metrics survive the wave.
+    #
+    # The snapshot latches on an env's FIRST reset, which is also what makes a
+    # mid-wave `nan_state` episode the reported one: the truncated replacement
+    # segment that runs in the same slot for the rest of the wave is ignored
+    # rather than reported as if it were a whole episode.
+    snap_taken = torch.zeros(num_envs, dtype=torch.bool, device=device)
+    snap_peak_air_time = torch.zeros(num_envs, device=device)
+    snap_peak_forward = torch.zeros(num_envs, device=device)
+    snap_non_foot = torch.zeros(num_envs, dtype=torch.bool, device=device)
+    snap_landing_z = torch.full((num_envs,), float("nan"), device=device)
+    snap_landing_tilt = torch.full((num_envs,), float("nan"), device=device)
+    snap_landing_both_feet = torch.zeros(num_envs, dtype=torch.bool, device=device)
+    snap_landing_recorded = torch.zeros(num_envs, dtype=torch.bool, device=device)
+    snap_final_z = torch.zeros(num_envs, device=device)
+    snap_final_upright = torch.full((num_envs,), -1.0, device=device)
+    snap_gravity_x = torch.zeros(num_envs, device=device)
+    snap_gravity_y = torch.zeros(num_envs, device=device)
+
+    def _terminal_state() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Trunk height, uprightness and body-frame gravity, as of right now."""
+        z = torch.nan_to_num(
+            asset.data.root_link_pos_w[:, 2] - env.scene.terrain.env_origins[:, 2], nan=0.0
+        )
+        quat = asset.data.root_link_quat_w
+        upright = torch.nan_to_num(
+            1.0 - 2.0 * (quat[:, 1].pow(2) + quat[:, 2].pow(2)), nan=-1.0
+        )
+        return z, upright, asset.data.projected_gravity_b
 
     obs = wrapped.get_observations()
     asset = env.scene["robot"]
@@ -278,6 +328,37 @@ def _run_wave(env: ManagerBasedRlEnv, wrapped: RslRlVecEnvWrapper, policy, wave_
         # fires occasionally within a wave, not only on the final step.
         reset_ids = env.reset_buf.nonzero(as_tuple=False).squeeze(-1)
         if reset_ids.numel() > 0:
+            # SNAPSHOT BEFORE RESET. env.reset() below zeroes the MDP
+            # accumulators and respawns the robot, so every quantity this
+            # wave reports has to be read here, while the measured episode's
+            # terminal state is still live. Latches once per slot, on its
+            # first reset.
+            snap_now = torch.zeros_like(snap_taken)
+            snap_now[reset_ids] = True
+            snap_now &= ~snap_taken
+            if bool(snap_now.any()):
+                term_z, term_upright, term_gravity = _terminal_state()
+                snap_peak_air_time = torch.where(
+                    snap_now, microduck_mdp.hop_metric_max_air_time(env), snap_peak_air_time
+                )
+                snap_peak_forward = torch.where(
+                    snap_now, microduck_mdp._hop_forward_state(env)[2], snap_peak_forward
+                )
+                snap_non_foot = torch.where(snap_now, non_foot_contact_ever, snap_non_foot)
+                snap_landing_z = torch.where(snap_now, landing_z, snap_landing_z)
+                snap_landing_tilt = torch.where(snap_now, landing_tilt_deg, snap_landing_tilt)
+                snap_landing_both_feet = torch.where(
+                    snap_now, landing_both_feet, snap_landing_both_feet
+                )
+                snap_landing_recorded = torch.where(
+                    snap_now, landing_recorded, snap_landing_recorded
+                )
+                snap_final_z = torch.where(snap_now, term_z, snap_final_z)
+                snap_final_upright = torch.where(snap_now, term_upright, snap_final_upright)
+                snap_gravity_x = torch.where(snap_now, term_gravity[:, 0], snap_gravity_x)
+                snap_gravity_y = torch.where(snap_now, term_gravity[:, 1], snap_gravity_y)
+                snap_taken = snap_taken | snap_now
+
             env.reset(env_ids=reset_ids)
             obs = wrapped.get_observations()
             # The MDP-level accumulators (_hop_max_air_time, _hop_max_forward_dist)
@@ -294,32 +375,56 @@ def _run_wave(env: ManagerBasedRlEnv, wrapped: RslRlVecEnvWrapper, policy, wave_
             landing_both_feet[reset_ids] = False
             landing_recorded[reset_ids] = False
 
-    peak_air_time = microduck_mdp.hop_metric_max_air_time(env)
-    peak_forward_dist = microduck_mdp._hop_forward_state(env)[2]
-    final_z = torch.nan_to_num(
-        asset.data.root_link_pos_w[:, 2] - env.scene.terrain.env_origins[:, 2], nan=0.0
-    )
-    final_quat = asset.data.root_link_quat_w
-    final_upright = torch.nan_to_num(
-        1.0 - 2.0 * (final_quat[:, 1].pow(2) + final_quat[:, 2].pow(2)), nan=-1.0
-    )
-    gravity_b = asset.data.projected_gravity_b
+    # Fallback for any slot that somehow never reset. mjlab's `time_out` term
+    # makes this unreachable in the hop env (it fires for every env on the
+    # final step), but an env cfg without it would otherwise report zeros
+    # silently -- so fall back to the live state rather than to nothing.
+    unsnapped = ~snap_taken
+    if bool(unsnapped.any()):
+        term_z, term_upright, term_gravity = _terminal_state()
+        peak_air_time = torch.where(
+            unsnapped, microduck_mdp.hop_metric_max_air_time(env), snap_peak_air_time
+        )
+        peak_forward_dist = torch.where(
+            unsnapped, microduck_mdp._hop_forward_state(env)[2], snap_peak_forward
+        )
+        non_foot = torch.where(unsnapped, non_foot_contact_ever, snap_non_foot)
+        land_z = torch.where(unsnapped, landing_z, snap_landing_z)
+        land_tilt = torch.where(unsnapped, landing_tilt_deg, snap_landing_tilt)
+        land_both = torch.where(unsnapped, landing_both_feet, snap_landing_both_feet)
+        land_recorded = torch.where(unsnapped, landing_recorded, snap_landing_recorded)
+        final_z = torch.where(unsnapped, term_z, snap_final_z)
+        final_upright = torch.where(unsnapped, term_upright, snap_final_upright)
+        gravity_x = torch.where(unsnapped, term_gravity[:, 0], snap_gravity_x)
+        gravity_y = torch.where(unsnapped, term_gravity[:, 1], snap_gravity_y)
+    else:
+        peak_air_time = snap_peak_air_time
+        peak_forward_dist = snap_peak_forward
+        non_foot = snap_non_foot
+        land_z = snap_landing_z
+        land_tilt = snap_landing_tilt
+        land_both = snap_landing_both_feet
+        land_recorded = snap_landing_recorded
+        final_z = snap_final_z
+        final_upright = snap_final_upright
+        gravity_x = snap_gravity_x
+        gravity_y = snap_gravity_y
 
     results = []
     for i in range(wave_n):
-        recorded = bool(landing_recorded[i])
+        recorded = bool(land_recorded[i])
         results.append(
             HopEpisodeObservation(
                 peak_air_time_s=float(peak_air_time[i]),
-                non_foot_contact_ever=bool(non_foot_contact_ever[i]),
-                landing_trunk_z_m=float(landing_z[i]) if recorded else None,
-                landing_tilt_deg=float(landing_tilt_deg[i]) if recorded else None,
-                landing_both_feet_contact=bool(landing_both_feet[i]) if recorded else None,
+                non_foot_contact_ever=bool(non_foot[i]),
+                landing_trunk_z_m=float(land_z[i]) if recorded else None,
+                landing_tilt_deg=float(land_tilt[i]) if recorded else None,
+                landing_both_feet_contact=bool(land_both[i]) if recorded else None,
                 peak_forward_dist_m=float(peak_forward_dist[i]),
                 final_trunk_z_m=float(final_z[i]),
                 final_upright=float(final_upright[i]),
-                final_gravity_body_x=float(gravity_b[i, 0]),
-                final_gravity_body_y=float(gravity_b[i, 1]),
+                final_gravity_body_x=float(gravity_x[i]),
+                final_gravity_body_y=float(gravity_y[i]),
             )
         )
     return results
