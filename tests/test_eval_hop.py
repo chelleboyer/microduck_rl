@@ -228,6 +228,35 @@ def test_eval_hop_reports_peak_forward_displacement(eh):
     assert "forward" in buf.getvalue().lower()
 
 
+def test_eval_hop_clears_local_bookkeeping_on_mid_wave_reset(eh):
+    """A mid-wave env.reset(env_ids=...) (the manual-reset handshake) only
+    clears the MDP-level accumulators (reset_hop_state zeroes
+    _hop_max_air_time/_hop_max_forward_dist for those env_ids). _run_wave's
+    own per-episode locals -- non_foot_contact_ever and the landing_* latches
+    -- must be cleared too, or a later episode segment in the same wave slot
+    inherits an earlier, different episode's state and the reported
+    HopEpisodeObservation splices two episodes together. Lock at the source
+    level that every local bookkeeping tensor is reset for reset_ids right
+    after the manual reset call."""
+    import inspect
+
+    source = inspect.getsource(eh._run_wave)
+    reset_call_index = source.index("env.reset(env_ids=")
+    cleared_after_reset = [
+        "was_airborne[reset_ids] = False",
+        "flight_start_step[reset_ids] = -1",
+        "non_foot_contact_ever[reset_ids] = False",
+        "landing_step[reset_ids] = -1",
+        "landing_z[reset_ids] = float(\"nan\")",
+        "landing_tilt_deg[reset_ids] = float(\"nan\")",
+        "landing_both_feet[reset_ids] = False",
+        "landing_recorded[reset_ids] = False",
+    ]
+    for line in cleared_after_reset:
+        assert line in source, line
+        assert source.index(line) > reset_call_index, line
+
+
 def test_eval_hop_run_wave_accumulates_forward_displacement(eh):
     """_run_wave must call _update_hop_forward_accum and read the frontier
     via _hop_forward_state, not re-derive forward displacement itself."""

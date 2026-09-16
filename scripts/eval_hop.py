@@ -280,6 +280,19 @@ def _run_wave(env: ManagerBasedRlEnv, wrapped: RslRlVecEnvWrapper, policy, wave_
         if reset_ids.numel() > 0:
             env.reset(env_ids=reset_ids)
             obs = wrapped.get_observations()
+            # The MDP-level accumulators (_hop_max_air_time, _hop_max_forward_dist)
+            # are cleared for these env_ids by the reset_hop_state event, but this
+            # loop's own per-episode bookkeeping is not — without this, a later
+            # episode segment in the same wave slot inherits an earlier, different
+            # episode's non_foot_contact_ever/landing_* state.
+            was_airborne[reset_ids] = False
+            flight_start_step[reset_ids] = -1
+            non_foot_contact_ever[reset_ids] = False
+            landing_step[reset_ids] = -1
+            landing_z[reset_ids] = float("nan")
+            landing_tilt_deg[reset_ids] = float("nan")
+            landing_both_feet[reset_ids] = False
+            landing_recorded[reset_ids] = False
 
     peak_air_time = microduck_mdp.hop_metric_max_air_time(env)
     peak_forward_dist = microduck_mdp._hop_forward_state(env)[2]
