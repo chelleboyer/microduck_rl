@@ -151,3 +151,88 @@ def test_eval_hop_forces_spawn_via_get_term_cfg_not_cfg_events(eh):
     source = inspect.getsource(eh.run_battery)
     assert "event_manager.get_term_cfg" in source
     assert "env.cfg.events[" not in source
+
+
+def test_eval_hop_sets_auto_reset_false(eh):
+    """A landing + 0.5s snapshot can only be read off the SAME episode's
+    terminal state, and mjlab's auto-reset (the default) overwrites that
+    state the instant the episode ends. Lock this at the source level: no
+    existing test touches run_battery's env construction, so a refactor that
+    drops this unlabeled-looking line would silently corrupt every landing
+    snapshot for episodes that end before max_episode_length, and nothing
+    else would catch it."""
+    import inspect
+
+    source = inspect.getsource(eh.run_battery)
+    assert "auto_reset = False" in source
+
+
+def test_eval_hop_manually_resets_terminated_envs_within_a_wave(eh):
+    """mjlab's auto_reset=False contract requires the caller to call
+    env.reset(env_ids=...) for every env that terminates before the wave's
+    next step(), or that step() raises for the whole batch. The hop cfg's
+    sole non-timeout termination (nan_state) is an async per-env event, so a
+    512-episode wave is expected to hit it occasionally. Lock the handshake
+    at the source level."""
+    import inspect
+
+    source = inspect.getsource(eh._run_wave)
+    assert "env.reset(env_ids=" in source
+    assert "reset_buf" in source
+
+
+def test_eval_hop_inference_mode_spans_the_whole_multi_wave_loop(eh):
+    """torch promotes any tensor reassigned in-place inside inference_mode to
+    an inference tensor (e.g. the BAM actuator's per-step delay buffer). If
+    inference_mode were scoped to only _run_wave's step loop, the very next
+    wave's wrapped.reset() call in run_battery's while loop -- which sits
+    outside that scope -- would crash on the first in-place write to a
+    tensor the prior wave had just promoted: an unconditional failure on any
+    episodes > num_envs run, independent of any NaN termination. Lock that
+    the span wraps run_battery's while loop (both wrapped.reset() and
+    _run_wave) rather than living inside _run_wave alone."""
+    import inspect
+
+    battery_source = inspect.getsource(eh.run_battery)
+    assert "with torch.inference_mode():" in battery_source
+    # The span must open before the while loop, not inside it: the
+    # inference_mode line must precede the `while remaining > 0` line, and
+    # `_run_wave` must not open a second, independently-scoped span.
+    assert battery_source.index("with torch.inference_mode():") < battery_source.index(
+        "while remaining > 0"
+    )
+    wave_source = inspect.getsource(eh._run_wave)
+    assert "with torch.inference_mode():" not in wave_source
+
+
+def test_eval_hop_reports_peak_forward_displacement(eh):
+    """The plan's task description for this script requires recording peak
+    clean forward displacement from liftoff alongside air time and non-foot
+    contact. Prove the field exists and that report() surfaces it."""
+    import io
+    from contextlib import redirect_stdout
+
+    obs = eh.HopEpisodeObservation(
+        peak_air_time_s=eh.HOP_MIN_AIR_TIME + 0.02,
+        non_foot_contact_ever=False,
+        landing_trunk_z_m=eh.AC4_MIN_TRUNK_Z_M + 0.01,
+        landing_tilt_deg=eh.AC4_MAX_TILT_DEG - 5.0,
+        landing_both_feet_contact=True,
+        peak_forward_dist_m=0.123,
+    )
+    assert obs.peak_forward_dist_m == 0.123
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        eh.report([obs])
+    assert "forward" in buf.getvalue().lower()
+
+
+def test_eval_hop_run_wave_accumulates_forward_displacement(eh):
+    """_run_wave must call _update_hop_forward_accum and read the frontier
+    via _hop_forward_state, not re-derive forward displacement itself."""
+    import inspect
+
+    source = inspect.getsource(eh._run_wave)
+    assert "_update_hop_forward_accum(env)" in source
+    assert "_hop_forward_state(env)" in source
