@@ -8148,6 +8148,7 @@ def _update_hop_landing_clean(
     env: ManagerBasedRlEnv,
     min_air_time: float,
     sensor_name: str = "nonfoot_ground_contact",
+    rearm_on_flight: bool = False,
 ) -> None:
     """Latch the episode DIRTY on any non-foot ground contact after liftoff.
 
@@ -8187,11 +8188,19 @@ def _update_hop_landing_clean(
     found = env.scene.sensors[sensor_name].data.found
     touching = torch.nan_to_num(found, nan=0.0).reshape(found.shape[0], -1).any(dim=-1)
     gate_open = _hop_completion_gate(env, min_air_time) > 0.0
+    if rearm_on_flight:
+        # Perpetual hopping (Mjlab-BunnyHop): judge each landing on its own.
+        # A new whole-robot flight clears the latch, so a dirty landing costs
+        # the annuities only until the next liftoff instead of for the rest
+        # of a long episode — per-episode latching over 10 s would recreate
+        # run 4's no-gradient trap after the first brushed landing.
+        env._hop_landing_dirty = env._hop_landing_dirty & ~_hop_airborne_now(env)
     env._hop_landing_dirty = env._hop_landing_dirty | (gate_open & touching)
 
 
 def _hop_clean_landing(
-    env: ManagerBasedRlEnv, require: bool, min_air_time: float, dirty_scale: float = 0.0
+    env: ManagerBasedRlEnv, require: bool, min_air_time: float, dirty_scale: float = 0.0,
+    rearm_on_flight: bool = False,
 ):
     """Multiplier for the landing terms: ``dirty_scale`` once the landing latched dirty.
 
@@ -8208,7 +8217,7 @@ def _hop_clean_landing(
     """
     if not require:
         return 1.0
-    _update_hop_landing_clean(env, min_air_time)
+    _update_hop_landing_clean(env, min_air_time, rearm_on_flight=rearm_on_flight)
     return torch.where(
         env._hop_landing_dirty,
         torch.full_like(env._hop_clean_time, float(dirty_scale)),
@@ -8305,6 +8314,7 @@ def hop_landing_composite(
     stance: Optional[str] = None,
     require_clean_landing: bool = False,
     dirty_landing_scale: float = 0.0,
+    rearm_on_flight: bool = False,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
     """standing_composite_score × completion gate — the landing/recovery annuity.
@@ -8331,7 +8341,8 @@ def hop_landing_composite(
         asset_cfg=asset_cfg,
     )
     return (score * _hop_completion_gate(env, min_air_time) * _hop_stance(env, stance, min_air_time)
-            * _hop_clean_landing(env, require_clean_landing, min_air_time, dirty_landing_scale))
+            * _hop_clean_landing(env, require_clean_landing, min_air_time, dirty_landing_scale,
+                               rearm_on_flight))
 
 
 def hop_upright_after_landing(
@@ -8340,6 +8351,7 @@ def hop_upright_after_landing(
     stance: Optional[str] = None,
     require_clean_landing: bool = False,
     dirty_landing_scale: float = 0.0,
+    rearm_on_flight: bool = False,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
     """Linear cos(tilt) × completion gate — bootstrap pull toward vertical."""
@@ -8349,7 +8361,8 @@ def hop_upright_after_landing(
     upright = 1.0 - 2.0 * (quat[:, 1].pow(2) + quat[:, 2].pow(2))
     return (torch.clamp(upright, min=0.0) * _hop_completion_gate(env, min_air_time)
             * _hop_stance(env, stance, min_air_time)
-            * _hop_clean_landing(env, require_clean_landing, min_air_time, dirty_landing_scale))
+            * _hop_clean_landing(env, require_clean_landing, min_air_time, dirty_landing_scale,
+                               rearm_on_flight))
 
 
 def hop_height_after_landing(
@@ -8360,6 +8373,7 @@ def hop_height_after_landing(
     stance: Optional[str] = None,
     require_clean_landing: bool = False,
     dirty_landing_scale: float = 0.0,
+    rearm_on_flight: bool = False,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
     """Broad height Gaussian × completion gate — pull up to standing height."""
@@ -8370,7 +8384,8 @@ def hop_height_after_landing(
     )
     g = torch.exp(-((z - target_height) / std) ** 2)
     return (g * _hop_completion_gate(env, min_air_time) * _hop_stance(env, stance, min_air_time)
-            * _hop_clean_landing(env, require_clean_landing, min_air_time, dirty_landing_scale))
+            * _hop_clean_landing(env, require_clean_landing, min_air_time, dirty_landing_scale,
+                               rearm_on_flight))
 
 
 def hop_stand_tax(
@@ -8794,9 +8809,13 @@ def hop_metric_clean_landing(
     height_tol: float = 0.02,
     upright_min: float = 0.9,
     stance: Optional[str] = None,
+    rearm_on_flight: bool = False,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
     """stable_landing AND no non-foot ground contact at ANY point since liftoff.
+
+    With ``rearm_on_flight`` (Mjlab-BunnyHop) "since liftoff" means since the
+    LATEST liftoff, so it scores the episode's final landing.
 
     hop_metric_stable_landing checks non-foot contact only on the step it is
     read (reduce="last": the final one), so a robot that face-planted and
@@ -8811,5 +8830,5 @@ def hop_metric_clean_landing(
         env, target_height=target_height, min_air_time=min_air_time,
         height_tol=height_tol, upright_min=upright_min, stance=stance, asset_cfg=asset_cfg,
     )
-    _update_hop_landing_clean(env, min_air_time)
+    _update_hop_landing_clean(env, min_air_time, rearm_on_flight=rearm_on_flight)
     return ok * (~env._hop_landing_dirty).float()

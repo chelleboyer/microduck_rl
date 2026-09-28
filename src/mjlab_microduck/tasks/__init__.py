@@ -85,6 +85,7 @@ from .microduck_hop_env_cfg import (
     MicroduckHopLeftRlCfg,
     MicroduckHopRightRlCfg,
     MicroduckHopOnceRlCfg,
+    MicroduckBunnyHopRlCfg,
 )
 from .backlash import make_backlash_variant
 
@@ -261,6 +262,16 @@ register_mjlab_task(
     env_cfg=make_microduck_hop_env_cfg(once=True),
     play_env_cfg=make_microduck_hop_env_cfg(play=True, once=True),
     rl_cfg=MicroduckHopOnceRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
+# BunnyHop — the perpetual forward bunny hop: 10 s episodes, a fall
+# termination, landing quality judged per hop (make_microduck_hop_env_cfg(perpetual=True)).
+register_mjlab_task(
+    task_id="Mjlab-BunnyHop-Flat-MicroDuck",
+    env_cfg=make_microduck_hop_env_cfg(perpetual=True),
+    play_env_cfg=make_microduck_hop_env_cfg(play=True, perpetual=True),
+    rl_cfg=MicroduckBunnyHopRlCfg,
     runner_cls=MicroduckOnPolicyRunner,
 )
 

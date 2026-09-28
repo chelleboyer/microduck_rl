@@ -221,6 +221,32 @@ FORWARD_GATE_MIN_DWELL_ITERS = 100
 # (forward gate, dirty-landing scale) are collapsed to their final stage here.
 ONCE_EXTRA_FLIGHT_WEIGHT = -4.0
 
+# ── BunnyHop: perpetual forward bunny hop (make_microduck_hop_env_cfg(perpetual=True)) ─
+# Run 6's continuous hop, published as chelleboyer/microduck-bunny-hop, FALLS:
+# in the training-latency-matched rehearsal 55 of 59 distinct 10 s rollouts
+# tipped past 60 deg (scripts/rehearse_headless.py --match-training-delays,
+# return_traces). Touchdown pitch swings of +-40-60 deg built up hop over hop
+# (a porpoising the policy only just contains), and falls came both before
+# and after the 3 s training horizon. The hop task was built for ONE episodic
+# trick: 3 s episodes and no fall termination ("landing badly and
+# recovering IS part of the task"). A perpetual gait needs the locomotion
+# recipe instead:
+#   * long episodes, so the policy lives through the drift it has to damp;
+#   * a fall termination, so a fall forfeits all the annuity it would have
+#     earned — the pressure that keeps the rocking bounded (AGENTS.md: put
+#     anti-violence pressure on outcomes, never cap rotation speed);
+#   * the clean-landing latch re-armed per flight (see mdp
+#     _update_hop_landing_clean): over 10 s a per-episode latch would zero
+#     the annuities after the first brushed landing — run 4's trap;
+#   * standing spawns up to the handover height a standing policy leaves the
+#     robot at (the rehearsal starts at trunk z 0.123-0.125 and 18 of its
+#     falls were at the very first touchdown from there).
+# Continues run 6's model_1499 like HopOnce (--agent.resume, no warm-start
+# reset); the two curricula run 6 finished are collapsed.
+BUNNY_EPISODE_LENGTH_S = 10.0
+BUNNY_FALL_TILT_DEG = 60.0
+BUNNY_STANDING_Z_MAX = 0.126
+
 # ── Ranges (matched to the roulade/standup envs) ─────────────────────────────
 COM_RANDOMIZATION_RANGE             = 0.003   # ramped via curriculum
 HEAD_COM_RANDOMIZATION_RANGE        = 0.003   # ramped via curriculum
@@ -384,10 +410,23 @@ from mjlab_microduck.tasks.microduck_velocity_env_cfg import HEAD_BODY_NAMES
 from mjlab_microduck.tasks.symmetry import PpoWithSymmetryCfg, SYMMETRY_CFG
 
 
+def _collapse_run6_curricula(cfg: ManagerBasedRlEnvCfg) -> None:
+    """Set the two curricula run 6 finished to their final stage (AGENTS.md:
+    a continued policy was trained under the source's final conditions)."""
+    cfg.curriculum.pop("forward_gate", None)
+    cfg.curriculum.pop("dirty_landing_scale", None)
+    cfg.rewards["hop_forward_progress"].weight = FORWARD_WEIGHT_STAGES[-1]
+    cfg.events["set_hop_state"].params["midair_vx_range"] = MIDAIR_VX_RANGE
+    for name in ("hop_landing_composite", "hop_upright_after_landing",
+                 "hop_height_after_landing"):
+        cfg.rewards[name].params["dirty_landing_scale"] = DIRTY_LANDING_SCALE_STAGES[-1][1]
+
+
 def make_microduck_hop_env_cfg(
     play: bool = False,
     landing: str = "both",
     once: bool = False,
+    perpetual: bool = False,
 ) -> ManagerBasedRlEnvCfg:
     """Create Microduck hop environment configuration.
 
@@ -395,7 +434,9 @@ def make_microduck_hop_env_cfg(
     unchanged), or "left" / "right" (land on that foot only and hold it).
     ``once`` builds Mjlab-HopOnce: the same hop, then stand — flying again
     after the first landing costs (see ONCE_* constants).
+    ``perpetual`` builds Mjlab-BunnyHop: keep hopping, never fall (BUNNY_*).
     """
+    assert not (once and perpetual), "HopOnce and BunnyHop are different tasks"
     assert landing in HOP_LANDINGS, landing
     stance = None if landing == "both" else landing
 
@@ -1045,24 +1086,34 @@ def make_microduck_hop_env_cfg(
             params={"min_air_time": HOP_MIN_AIR_TIME},
             reduce="last",
         )
-        # Collapse the source run's curricula to their final stage.
-        cfg.curriculum.pop("forward_gate", None)
-        cfg.curriculum.pop("dirty_landing_scale", None)
-        cfg.rewards["hop_forward_progress"].weight = FORWARD_WEIGHT_STAGES[-1]
-        cfg.events["set_hop_state"].params["midair_vx_range"] = MIDAIR_VX_RANGE
+    if once or perpetual:
+        _collapse_run6_curricula(cfg)
+
+    if perpetual:
+        cfg.episode_length_s = BUNNY_EPISODE_LENGTH_S
+        cfg.commands["twist"].resampling_time_range = (BUNNY_EPISODE_LENGTH_S,
+                                                       BUNNY_EPISODE_LENGTH_S * 2)
+        cfg.terminations["fell"] = TerminationTermCfg(
+            func=mdp.bad_orientation,
+            params={"limit_angle": math.radians(BUNNY_FALL_TILT_DEG)},
+        )
+        cfg.events["set_hop_state"].params["standing_z_max"] = BUNNY_STANDING_Z_MAX
         for name in ("hop_landing_composite", "hop_upright_after_landing",
                      "hop_height_after_landing"):
-            cfg.rewards[name].params["dirty_landing_scale"] = DIRTY_LANDING_SCALE_STAGES[-1][1]
+            cfg.rewards[name].params["rearm_on_flight"] = True
+        cfg.metrics["clean_landing_rate"].params["rearm_on_flight"] = True
 
     return cfg
 
 
 # ── RL runner config ──────────────────────────────────────────────────────────
 
-def _hop_rl_cfg(landing: str = "both", once: bool = False) -> RslRlOnPolicyRunnerCfg:
+def _hop_rl_cfg(landing: str = "both", once: bool = False,
+                perpetual: bool = False) -> RslRlOnPolicyRunnerCfg:
     # Mirror loss only for the sagittal two-foot hop: the one-foot landings
     # name a side (AGENTS.md: never for an asymmetric task).
-    suffix = ("" if landing == "both" else f"_{landing}") + ("_once" if once else "")
+    suffix = (("" if landing == "both" else f"_{landing}") + ("_once" if once else "")
+              + ("_bunny" if perpetual else ""))
     return RslRlOnPolicyRunnerCfg(
         actor=RslRlModelCfg(
             hidden_dims=(512, 256, 128),
@@ -1107,3 +1158,4 @@ MicroduckHopRlCfg = _hop_rl_cfg("both")
 MicroduckHopLeftRlCfg = _hop_rl_cfg("left")
 MicroduckHopRightRlCfg = _hop_rl_cfg("right")
 MicroduckHopOnceRlCfg = _hop_rl_cfg("both", once=True)
+MicroduckBunnyHopRlCfg = _hop_rl_cfg("both", perpetual=True)
