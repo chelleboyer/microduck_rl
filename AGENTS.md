@@ -75,6 +75,19 @@ State as of 2026-09-14:
   on every landing and ~90% of episodes record none — so its AC #4 rate is an artifact on this
   policy; `clean_landing_rate` is pessimistic too, since one brushed landing out of ~10 fails
   the episode. Single hop vs perpetual bunny hop is a product decision still open.
+- **After run 6 (2026-09-28): B = perpetual bunny hop, A = one hop then stand.**
+  - Run 6's hop, published private as `chelleboyer/microduck-bunny-hop`, FELL in the
+    delay-matched rehearsal: 59/64 rollouts × 10 s tipped past 60°. The cause was touchdown pitch
+    swings of ±40–60° growing hop over hop, with no fall termination and only 3 s episodes.
+  - **`Mjlab-BunnyHop`** (`perpetual=True`: 10 s episodes, `fell` at 60°, the landing latch
+    re-armed per flight, standing spawns up to z 0.126), continued from run 6 for 1500 iters
+    (W&B `fm49sr5f`). Training fall share went 83% → 25%. Rehearsal of `model_2998`: falls
+    **9/64**, feet-only landings **98%**, but 1.43 hops/s and 0.05 m/s. It traded forward speed
+    for stability; the fall share plateaued at ~30% from iter ~1600 to ~2700.
+  - **`Mjlab-HopOnce`** (`once=True`, W&B `asfkt0rq`) halved re-hops (~10 → ~5 per episode) but
+    did not stop them. A per-phase reward breakdown showed why: `hop_air_time` and
+    `hop_forward_progress` are best-so-far frontiers, so each re-hop that beats the first flight
+    is PAID. Fix (not yet built): pay take-off terms only until the first landing.
 - **Run 6 design: vertical first, forward second** (the plan's AC #3).
   `hop_forward_progress` was paying for the forward lean from step 0. `ENABLE_FORWARD_GATE`:
   forward weight AND the mid-air spawn's forward speed start at 0 and advance one stage
