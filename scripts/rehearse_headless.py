@@ -206,7 +206,7 @@ def _delay_observations(policy, rng, n_joints):
 
 def run_rehearsal(policy_path, seconds=6.0, scene=None, no_bam=False, video=None,
                   delay=None, match_training_delays=False, act_delay_substeps=None,
-                  seed=None, **bam_kwargs):
+                  seed=None, return_traces=False, **bam_kwargs):
     model, data, bam_ctrl, policy, xml_path = build_sim(
         policy_path, scene=scene, no_bam=no_bam, delay=delay, **bam_kwargs)
 
@@ -256,6 +256,7 @@ def run_rehearsal(policy_path, seconds=6.0, scene=None, no_bam=False, video=None
     control_dt = DECIMATION * model.opt.timestep
     n_steps = int(round(seconds / control_dt))
     heights, cos_tilts, airborne, nonfoot = [], [], [], []
+    pitch, roll, vfwd, nf_bodies = [], [], [], []
     nan_step = None
 
     for step in range(n_steps):
@@ -288,6 +289,19 @@ def run_rehearsal(policy_path, seconds=6.0, scene=None, no_bam=False, video=None
         on_floor, nf = _floor_contact_state(model, data, floor_id, robot_geom, foot_geom)
         airborne.append(not on_floor)
         nonfoot.append(nf)
+        if return_traces:
+            R = data.xmat[trunk_id].reshape(3, 3)
+            # Body x = forward: pitch = nose-down positive, roll = right-side-down positive.
+            pitch.append(float(math.degrees(math.asin(np.clip(-R[2, 0], -1, 1)))))
+            roll.append(float(math.degrees(math.atan2(R[2, 1], R[2, 2]))))
+            vfwd.append(float(np.dot(data.qvel[:3], heading)))
+            touching = set()
+            for c in data.contact[:data.ncon]:
+                for g, o in ((c.geom1, c.geom2), (c.geom2, c.geom1)):
+                    if o == floor_id and robot_geom[g] and not foot_geom[g]:
+                        touching.add(mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY,
+                                                       int(model.geom_bodyid[g])))
+            nf_bodies.append(sorted(touching))
 
         if renderer is not None:
             renderer.update_scene(data, camera=cam)
@@ -334,6 +348,11 @@ def run_rehearsal(policy_path, seconds=6.0, scene=None, no_bam=False, video=None
         nonfoot_steps=int(sum(nonfoot)),
         training_delays=bool(match_training_delays), act_delay_substeps=act_lag,
     )
+    if return_traces:
+        summary["traces"] = dict(
+            dt=control_dt, z=heights, cos_tilt=cos_tilts, pitch_deg=pitch, roll_deg=roll,
+            v_forward=vfwd, airborne=airborne, nonfoot=nonfoot, nonfoot_bodies=nf_bodies,
+            flights=flights)
 
     if renderer is not None:
         renderer.close()
