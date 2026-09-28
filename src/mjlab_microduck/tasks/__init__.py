@@ -78,6 +78,8 @@ from .microduck_roulade_env_cfg import (
 from .microduck_hop_env_cfg import (
     make_microduck_hop_env_cfg,
     MicroduckHopRlCfg,
+    MicroduckHopLeftRlCfg,
+    MicroduckHopRightRlCfg,
 )
 from .backlash import make_backlash_variant
 
@@ -246,6 +248,17 @@ register_mjlab_task(
     rl_cfg=MicroduckHopRlCfg,
     runner_cls=MicroduckOnPolicyRunner,
 )
+
+# Hopscotch one-foot landings — the same hop, landing on the named foot only
+# and holding it (microduck_hop_env_cfg.py, landing="left"/"right").
+for _landing, _hop_rl in (("Left", MicroduckHopLeftRlCfg), ("Right", MicroduckHopRightRlCfg)):
+    register_mjlab_task(
+        task_id=f"Mjlab-Hop{_landing}-Flat-MicroDuck",
+        env_cfg=make_microduck_hop_env_cfg(landing=_landing.lower()),
+        play_env_cfg=make_microduck_hop_env_cfg(play=True, landing=_landing.lower()),
+        rl_cfg=_hop_rl,
+        runner_cls=MicroduckOnPolicyRunner,
+    )
 
 # Backlash variants — ±1° serial gear play per servo + encoder-through-backlash
 # actuator feedback and joint obs (see tasks/backlash.py). Each family keeps its

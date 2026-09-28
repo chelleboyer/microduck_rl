@@ -9,8 +9,17 @@ motion).
 Scope note: the product direction is a forward hop, not the in-place hop the
 PRD's v1 non-goals describe (a real-time call from the project owner,
 superseding that draft) — hop_forward_progress below is the training-side
-answer. Landing on two feet stays the v1 target; one-foot landing is an
-explicitly later step, not attempted here.
+answer. Landing on two feet stays the v1 target (Mjlab-Hop-Flat-MicroDuck).
+
+One-foot landings (hopscotch, 2026-09-28): ``landing="left"`` / ``"right"``
+builds Mjlab-HopLeft / Mjlab-HopRight — the same take-off, flight and
+exploit guards, with the landing terms gated by
+mdp.hop_landing_stance_factor: they pay only after a touchdown that came down
+on exactly the named foot, while the robot is still standing on it alone. The
+pose target shrinks to the support leg (the other one is meant to be up) and
+the mirror loss is off (HopLeft's mirror IS HopRight). ``landing="both"``
+(the default) builds the two-foot task exactly as before. Whether a one-foot
+landing is holdable on this robot at all is unmeasured — a hypothesis.
 
 Course correction 2026-09-12 (mid-run-1): the first forward-hop run's
 dominant strategy at ~1300/6000 iterations was a butt-bounce — trunk hits
@@ -289,6 +298,9 @@ SPAWN_MIDAIR_PROB   = 0.30
 TARGET_LAUNCH_VZ = 0.60
 
 _LEG_JOINTS = [0, 1, 2, 3, 4, 9, 10, 11, 12, 13]
+# Support-leg pose targets for the one-foot landings (servo index order).
+_SUPPORT_LEG_JOINTS = {"left": [0, 1, 2, 3, 4], "right": [9, 10, 11, 12, 13]}
+HOP_LANDINGS = ("both", "left", "right")
 
 from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.envs.mdp import dr
@@ -317,8 +329,17 @@ from mjlab_microduck.tasks.microduck_velocity_env_cfg import HEAD_BODY_NAMES
 from mjlab_microduck.tasks.symmetry import PpoWithSymmetryCfg, SYMMETRY_CFG
 
 
-def make_microduck_hop_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
-    """Create Microduck hop environment configuration."""
+def make_microduck_hop_env_cfg(
+    play: bool = False,
+    landing: str = "both",
+) -> ManagerBasedRlEnvCfg:
+    """Create Microduck hop environment configuration.
+
+    ``landing`` picks what counts as landing: "both" (the two-foot hop,
+    unchanged), or "left" / "right" (land on that foot only and hold it).
+    """
+    assert landing in HOP_LANDINGS, landing
+    stance = None if landing == "both" else landing
 
     feet_ground_cfg = ContactSensorCfg(
         name="feet_ground_contact",
@@ -458,7 +479,7 @@ def make_microduck_hop_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
             "height_std":    0.04,
             "upright_std":   0.40,
             "pose_std":      0.40,
-            "joint_indices": _LEG_JOINTS,
+            "joint_indices": _LEG_JOINTS if stance is None else _SUPPORT_LEG_JOINTS[stance],
             "min_air_time":  HOP_MIN_AIR_TIME,
         },
     )
@@ -472,6 +493,11 @@ def make_microduck_hop_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         weight=1.0,
         params={"target_height": STAND_Z, "std": 0.04, "min_air_time": HOP_MIN_AIR_TIME},
     )
+    if stance is not None:
+        for name in ("hop_landing_composite", "hop_upright_after_landing",
+                     "hop_height_after_landing"):
+            cfg.rewards[name].params["stance"] = stance
+
     cfg.rewards["hop_stand_tax"] = RewardTermCfg(
         func=microduck_mdp.hop_stand_tax,
         weight=5.0,
@@ -570,6 +596,8 @@ def make_microduck_hop_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         params={"target_height": STAND_Z, "min_air_time": HOP_MIN_AIR_TIME},
         reduce="last",
     )
+    if stance is not None:
+        cfg.metrics["stable_landing_rate"].params["stance"] = stance
 
     # Always-on upright would oppose the push-off/flight phase; landing
     # uprightness is handled by the completion-gated terms above.
@@ -901,41 +929,50 @@ def make_microduck_hop_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
 
 # ── RL runner config ──────────────────────────────────────────────────────────
 
-MicroduckHopRlCfg = RslRlOnPolicyRunnerCfg(
-    actor=RslRlModelCfg(
-        hidden_dims=(512, 256, 128),
-        activation="elu",
-        obs_normalization=True,  # normalizer MUST be baked into ONNX by export.py
-        distribution_cfg={
-            "class_name": "GaussianDistribution",
-            "init_std": 1.0,
-            "std_type": "scalar",
-        },
-    ),
-    critic=RslRlModelCfg(
-        hidden_dims=(512, 256, 128),
-        activation="elu",
-        obs_normalization=True,
-    ),
-    algorithm=PpoWithSymmetryCfg(
-        value_loss_coef=1.0,
-        use_clipped_value_loss=True,
-        clip_param=0.2,
-        entropy_coef=0.01,
-        num_learning_epochs=5,
-        num_mini_batches=4,
-        learning_rate=1.0e-3,
-        schedule="adaptive",
-        gamma=0.99,
-        lam=0.95,
-        desired_kl=0.01,
-        max_grad_norm=1.0,
-        symmetry_cfg=SYMMETRY_CFG if ENABLE_SYMMETRY else None,
-    ),
-    wandb_project="mjlab_microduck",
-    experiment_name="microduck_hop",
-    run_name="microduck_hop",
-    save_interval=250,
-    num_steps_per_env=24,
-    max_iterations=6_000,
-)
+def _hop_rl_cfg(landing: str = "both") -> RslRlOnPolicyRunnerCfg:
+    # Mirror loss only for the sagittal two-foot hop: the one-foot landings
+    # name a side (AGENTS.md: never for an asymmetric task).
+    suffix = "" if landing == "both" else f"_{landing}"
+    return RslRlOnPolicyRunnerCfg(
+        actor=RslRlModelCfg(
+            hidden_dims=(512, 256, 128),
+            activation="elu",
+            obs_normalization=True,  # normalizer MUST be baked into ONNX by export.py
+            distribution_cfg={
+                "class_name": "GaussianDistribution",
+                "init_std": 1.0,
+                "std_type": "scalar",
+            },
+        ),
+        critic=RslRlModelCfg(
+            hidden_dims=(512, 256, 128),
+            activation="elu",
+            obs_normalization=True,
+        ),
+        algorithm=PpoWithSymmetryCfg(
+            value_loss_coef=1.0,
+            use_clipped_value_loss=True,
+            clip_param=0.2,
+            entropy_coef=0.01,
+            num_learning_epochs=5,
+            num_mini_batches=4,
+            learning_rate=1.0e-3,
+            schedule="adaptive",
+            gamma=0.99,
+            lam=0.95,
+            desired_kl=0.01,
+            max_grad_norm=1.0,
+            symmetry_cfg=SYMMETRY_CFG if ENABLE_SYMMETRY and landing == "both" else None,
+        ),
+        wandb_project="mjlab_microduck",
+        experiment_name=f"microduck_hop{suffix}",
+        run_name=f"microduck_hop{suffix}",
+        save_interval=250,
+        num_steps_per_env=24,
+        max_iterations=6_000,
+    )
+
+
+MicroduckHopRlCfg = _hop_rl_cfg("both")
+MicroduckHopLeftRlCfg = _hop_rl_cfg("left")
+MicroduckHopRightRlCfg = _hop_rl_cfg("right")

@@ -7474,6 +7474,12 @@ def _hop_state(env: ManagerBasedRlEnv) -> tuple:
         env._hop_max_com_rise = z.clone()
         env._hop_max_foot_rise = z.clone()
         env._hop_last_metric_step = -1
+        # One-foot landing latch (hop_landing_stance_factor): whether the
+        # first touchdown after a qualifying flight came down on exactly the
+        # named feet. Only the HopLeft / HopRight tasks read it.
+        env._hop_td_latched = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+        env._hop_td_clean = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+        env._hop_last_td_step = -1
     return env._hop_max_air_time, env._hop_paid, env._hop_completed
 
 
@@ -7833,6 +7839,8 @@ def reset_hop_state(
     env._hop_foot_ref_set[env_ids] = False
     env._hop_ground_start[env_ids] = ~is_mid
     env._hop_max_com_rise[env_ids] = 0.0
+    env._hop_td_latched[env_ids] = False
+    env._hop_td_clean[env_ids] = False
     env._hop_max_foot_rise[env_ids] = 0.0
 
 
@@ -7980,6 +7988,59 @@ def hop_forward_progress(
     return delta / (env.step_dt * target_distance)
 
 
+_HOP_STANCES = ("left", "right")
+
+
+def _hop_feet_down(env: ManagerBasedRlEnv, sensor_name: str = "feet_ground_contact") -> tuple:
+    """(left, right) foot-on-terrain booleans, LEFT first per the sensor's geom order."""
+    if sensor_name not in env.scene.sensors:
+        z = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+        return z, z
+    found = env.scene.sensors[sensor_name].data.found
+    found = torch.nan_to_num(found, nan=0.0).reshape(found.shape[0], -1)[:, :2] > 0
+    return found[:, 0], found[:, 1]
+
+
+def hop_landing_stance_factor(
+    env: ManagerBasedRlEnv,
+    stance: str,
+    min_air_time: float,
+) -> torch.Tensor:
+    """1.0 while a one-foot hopscotch landing is being held, else 0.0.
+
+    Two conditions, both required:
+      • CLEAN TOUCHDOWN (latched): the first foot contact after the completion
+        gate opens — i.e. the landing of a qualifying flight, or of a mid-air
+        spawn, whose gate is pre-seeded open — came down on the named foot
+        ONLY. Landing on the other foot or on both latches the episode at
+        zero, so shuffling onto the right stance afterwards earns nothing:
+        the landing is the test, as in hopscotch.
+      • IN STANCE NOW: the named foot is down and the other is up.
+
+    Step-guarded like the other hop accumulators so every term that reads it
+    in one control step sees the same latch.
+    """
+    assert stance in _HOP_STANCES, stance
+    _hop_state(env)
+    left, right = _hop_feet_down(env)
+    ok_now = (left & ~right) if stance == "left" else (right & ~left)
+    step = int(env.common_step_counter)
+    if step != env._hop_last_td_step:
+        gate_open = _hop_completion_gate(env, min_air_time) > 0.0
+        touchdown = gate_open & ~env._hop_td_latched & (left | right)
+        env._hop_td_clean = torch.where(touchdown, ok_now, env._hop_td_clean)
+        env._hop_td_latched = env._hop_td_latched | touchdown
+        env._hop_last_td_step = step
+    return (env._hop_td_clean & ok_now).float()
+
+
+def _hop_stance(env: ManagerBasedRlEnv, stance: Optional[str], min_air_time: float):
+    """Multiplier for the landing terms: 1 for the two-foot task (stance None)."""
+    if stance is None:
+        return 1.0
+    return hop_landing_stance_factor(env, stance, min_air_time)
+
+
 def hop_landing_composite(
     env: ManagerBasedRlEnv,
     target_height: float,
@@ -7989,13 +8050,16 @@ def hop_landing_composite(
     joint_indices: list,
     min_air_time: float = 0.06,
     target_overrides: Optional[dict] = None,
+    stance: Optional[str] = None,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
     """standing_composite_score × completion gate — the landing/recovery annuity.
 
     Mirrors roulade_landing_composite exactly, gated on having hopped
     (simultaneous air time past min_air_time) instead of rotation past a
-    threshold.
+    threshold. ``stance`` ("left" / "right", the one-foot hopscotch landings)
+    additionally multiplies by hop_landing_stance_factor; None (the two-foot
+    Mjlab-Hop task) leaves this term exactly as it was.
     """
     asset: Entity = env.scene[asset_cfg.name]
     _update_hop_accum(env)
@@ -8009,12 +8073,13 @@ def hop_landing_composite(
         target_overrides=target_overrides,
         asset_cfg=asset_cfg,
     )
-    return score * _hop_completion_gate(env, min_air_time)
+    return score * _hop_completion_gate(env, min_air_time) * _hop_stance(env, stance, min_air_time)
 
 
 def hop_upright_after_landing(
     env: ManagerBasedRlEnv,
     min_air_time: float = 0.06,
+    stance: Optional[str] = None,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
     """Linear cos(tilt) × completion gate — bootstrap pull toward vertical."""
@@ -8022,7 +8087,8 @@ def hop_upright_after_landing(
     _update_hop_accum(env)
     quat = asset.data.root_link_quat_w
     upright = 1.0 - 2.0 * (quat[:, 1].pow(2) + quat[:, 2].pow(2))
-    return torch.clamp(upright, min=0.0) * _hop_completion_gate(env, min_air_time)
+    return (torch.clamp(upright, min=0.0) * _hop_completion_gate(env, min_air_time)
+            * _hop_stance(env, stance, min_air_time))
 
 
 def hop_height_after_landing(
@@ -8030,6 +8096,7 @@ def hop_height_after_landing(
     target_height: float,
     std: float = 0.04,
     min_air_time: float = 0.06,
+    stance: Optional[str] = None,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
     """Broad height Gaussian × completion gate — pull up to standing height."""
@@ -8039,7 +8106,7 @@ def hop_height_after_landing(
         asset.data.root_link_pos_w[:, 2] - env.scene.terrain.env_origins[:, 2], nan=0.0
     )
     g = torch.exp(-((z - target_height) / std) ** 2)
-    return g * _hop_completion_gate(env, min_air_time)
+    return g * _hop_completion_gate(env, min_air_time) * _hop_stance(env, stance, min_air_time)
 
 
 def hop_stand_tax(
@@ -8418,9 +8485,13 @@ def hop_metric_stable_landing(
     min_air_time: float = 0.06,
     height_tol: float = 0.02,
     upright_min: float = 0.9,
+    stance: Optional[str] = None,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
     """1.0 where the robot took off AND is now standing cleanly. reduce="last".
+
+    With ``stance`` set (the one-foot landings), "standing cleanly" also means
+    the touchdown was clean and the robot is standing on exactly that foot.
 
     All four conditions at once, evaluated on the step it is read: a
     qualifying flight happened this episode, the trunk is within height_tol
@@ -8449,4 +8520,4 @@ def hop_metric_stable_landing(
         & (upright >= upright_min)
         & ~nf_touching
     )
-    return ok.float()
+    return ok.float() * _hop_stance(env, stance, min_air_time)
