@@ -201,6 +201,26 @@ FORWARD_WEIGHT_STAGES = (0.0, 1.5, 3.0, 5.0)   # last = the original fixed weigh
 FORWARD_GATE_CLEAN_THRESHOLD = 0.30
 FORWARD_GATE_MIN_DWELL_ITERS = 100
 
+# ── HopOnce: one forward hop, then stand (make_microduck_hop_env_cfg(once=True)) ─
+# Run 6 (W&B 2qbd5bto) learned a CONTINUOUS bunny hop (~10 flights per 3 s
+# episode, 89% of landings feet-only) — published as the perpetual
+# chelleboyer/microduck-bunny-hop. Nothing in the hop stack says "stop after
+# one": air time and forward progress are max-so-far frontiers, so re-hopping
+# was free. HopOnce adds mdp.hop_extra_flight_cost (per airborne step after
+# the first touchdown). Weight -4.0 matches the landing composite's peak rate
+# (weight 4 x score <= 1 per second), so a second hop always costs at least
+# what standing through it would have earned.
+#
+# Meant to CONTINUE from run 6's model_1499 — `--agent.resume True` WITHOUT
+# MICRODUCK_WARM_START, so the step counter carries on from 36000 (iter 1500).
+# The shared curricula then stay where run 6 left them (com_range had already
+# reached 0.01; a warm start would have quietly eased it back to 0.003) and
+# their designed post-discovery stages — action_rate -0.2, gentle_landing,
+# torque_rate, a more standing-heavy spawn mix — switch on at 1500, which is
+# the right polish for "stick the landing". The two curricula run 6 finished
+# (forward gate, dirty-landing scale) are collapsed to their final stage here.
+ONCE_EXTRA_FLIGHT_WEIGHT = -4.0
+
 # ── Ranges (matched to the roulade/standup envs) ─────────────────────────────
 COM_RANDOMIZATION_RANGE             = 0.003   # ramped via curriculum
 HEAD_COM_RANDOMIZATION_RANGE        = 0.003   # ramped via curriculum
@@ -367,11 +387,14 @@ from mjlab_microduck.tasks.symmetry import PpoWithSymmetryCfg, SYMMETRY_CFG
 def make_microduck_hop_env_cfg(
     play: bool = False,
     landing: str = "both",
+    once: bool = False,
 ) -> ManagerBasedRlEnvCfg:
     """Create Microduck hop environment configuration.
 
     ``landing`` picks what counts as landing: "both" (the two-foot hop,
     unchanged), or "left" / "right" (land on that foot only and hold it).
+    ``once`` builds Mjlab-HopOnce: the same hop, then stand — flying again
+    after the first landing costs (see ONCE_* constants).
     """
     assert landing in HOP_LANDINGS, landing
     stance = None if landing == "both" else landing
@@ -1011,15 +1034,35 @@ def make_microduck_hop_env_cfg(
             },
         )
 
+    if once:
+        cfg.rewards["hop_extra_flight"] = RewardTermCfg(
+            func=microduck_mdp.hop_extra_flight_cost,
+            weight=ONCE_EXTRA_FLIGHT_WEIGHT,
+            params={"min_air_time": HOP_MIN_AIR_TIME},
+        )
+        cfg.metrics["extra_flight_rate"] = MetricsTermCfg(
+            func=microduck_mdp.hop_metric_extra_flight,
+            params={"min_air_time": HOP_MIN_AIR_TIME},
+            reduce="last",
+        )
+        # Collapse the source run's curricula to their final stage.
+        cfg.curriculum.pop("forward_gate", None)
+        cfg.curriculum.pop("dirty_landing_scale", None)
+        cfg.rewards["hop_forward_progress"].weight = FORWARD_WEIGHT_STAGES[-1]
+        cfg.events["set_hop_state"].params["midair_vx_range"] = MIDAIR_VX_RANGE
+        for name in ("hop_landing_composite", "hop_upright_after_landing",
+                     "hop_height_after_landing"):
+            cfg.rewards[name].params["dirty_landing_scale"] = DIRTY_LANDING_SCALE_STAGES[-1][1]
+
     return cfg
 
 
 # ── RL runner config ──────────────────────────────────────────────────────────
 
-def _hop_rl_cfg(landing: str = "both") -> RslRlOnPolicyRunnerCfg:
+def _hop_rl_cfg(landing: str = "both", once: bool = False) -> RslRlOnPolicyRunnerCfg:
     # Mirror loss only for the sagittal two-foot hop: the one-foot landings
     # name a side (AGENTS.md: never for an asymmetric task).
-    suffix = "" if landing == "both" else f"_{landing}"
+    suffix = ("" if landing == "both" else f"_{landing}") + ("_once" if once else "")
     return RslRlOnPolicyRunnerCfg(
         actor=RslRlModelCfg(
             hidden_dims=(512, 256, 128),
@@ -1063,3 +1106,4 @@ def _hop_rl_cfg(landing: str = "both") -> RslRlOnPolicyRunnerCfg:
 MicroduckHopRlCfg = _hop_rl_cfg("both")
 MicroduckHopLeftRlCfg = _hop_rl_cfg("left")
 MicroduckHopRightRlCfg = _hop_rl_cfg("right")
+MicroduckHopOnceRlCfg = _hop_rl_cfg("both", once=True)

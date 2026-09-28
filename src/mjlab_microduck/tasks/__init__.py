@@ -84,6 +84,7 @@ from .microduck_hop_env_cfg import (
     MicroduckHopRlCfg,
     MicroduckHopLeftRlCfg,
     MicroduckHopRightRlCfg,
+    MicroduckHopOnceRlCfg,
 )
 from .backlash import make_backlash_variant
 
@@ -250,6 +251,16 @@ register_mjlab_task(
     env_cfg=make_microduck_hop_env_cfg(),
     play_env_cfg=make_microduck_hop_env_cfg(play=True),
     rl_cfg=MicroduckHopRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
+# HopOnce — the same two-foot forward hop, then stand still: flying again
+# after the first landing costs (make_microduck_hop_env_cfg(once=True)).
+register_mjlab_task(
+    task_id="Mjlab-HopOnce-Flat-MicroDuck",
+    env_cfg=make_microduck_hop_env_cfg(once=True),
+    play_env_cfg=make_microduck_hop_env_cfg(play=True, once=True),
+    rl_cfg=MicroduckHopOnceRlCfg,
     runner_cls=MicroduckOnPolicyRunner,
 )
 

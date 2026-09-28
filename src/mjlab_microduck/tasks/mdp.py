@@ -7575,6 +7575,11 @@ def _hop_state(env: ManagerBasedRlEnv) -> tuple:
         # a non-foot body touches the ground after the completion gate opens.
         env._hop_landing_dirty = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
         env._hop_last_landing_step = -1
+        # HopOnce (hop_extra_flight_cost): first touchdown after the gate
+        # opened, and whether the robot flew again after it.
+        env._hop_landed_once = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+        env._hop_extra_flight = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+        env._hop_last_once_step = -1
     return env._hop_max_air_time, env._hop_paid, env._hop_completed
 
 
@@ -7937,6 +7942,8 @@ def reset_hop_state(
     env._hop_td_latched[env_ids] = False
     env._hop_td_clean[env_ids] = False
     env._hop_landing_dirty[env_ids] = False
+    env._hop_landed_once[env_ids] = False
+    env._hop_extra_flight[env_ids] = False
     env._hop_max_foot_rise[env_ids] = 0.0
 
 
@@ -8207,6 +8214,53 @@ def _hop_clean_landing(
         torch.full_like(env._hop_clean_time, float(dirty_scale)),
         torch.ones_like(env._hop_clean_time),
     )
+
+
+def _update_hop_landed_once(env: ManagerBasedRlEnv, min_air_time: float) -> None:
+    """Latch the first touchdown after a qualifying flight; flag any flight after it.
+
+    Step-guarded. ``_hop_landed_once`` sets on the first step the robot is not
+    fully airborne once the completion gate is open (after a real flight, or
+    at the touchdown a mid-air spawn was spawned into). ``_hop_extra_flight``
+    then records any later step with the whole robot off the ground.
+    """
+    _hop_state(env)
+    step = int(env.common_step_counter)
+    if step == env._hop_last_once_step:
+        return
+    env._hop_last_once_step = step
+    airborne = _hop_airborne_now(env)
+    extra = env._hop_landed_once & airborne
+    env._hop_extra_flight = env._hop_extra_flight | extra
+    gate_open = _hop_completion_gate(env, min_air_time) > 0.0
+    env._hop_landed_once = env._hop_landed_once | (gate_open & ~airborne)
+
+
+def hop_extra_flight_cost(env: ManagerBasedRlEnv, min_air_time: float = 0.06) -> torch.Tensor:
+    """Cost: 1.0 on every step the robot is airborne AFTER its first landing.
+
+    Mjlab-HopOnce: one forward hop, then stand. Run 6 (W&B 2qbd5bto) learned
+    a continuous bunny hop (~10 flights per 3 s episode) because nothing in
+    the two-foot hop's stack says "stop after one" — air time and forward
+    progress are max-so-far frontiers, so re-hopping cost nothing. Silent
+    until the first touchdown, so it cannot tax the hop itself; dense (per
+    airborne step), so a shorter re-hop is cheaper than a longer one and the
+    gradient points at "stay down" rather than at a cliff. Also charges the
+    brief whole-robot bounces of a hard landing, which is the right pressure
+    for a landing that should stick.
+
+    Ordinary cost (returns >= 0) -> NEGATIVE weight.
+    """
+    _update_hop_accum(env)
+    _update_hop_landed_once(env, min_air_time)
+    return (env._hop_landed_once & _hop_airborne_now(env)).float()
+
+
+def hop_metric_extra_flight(env: ManagerBasedRlEnv, min_air_time: float = 0.06) -> torch.Tensor:
+    """1.0 where the robot flew again after its first landing. reduce="last"."""
+    _update_hop_accum(env)
+    _update_hop_landed_once(env, min_air_time)
+    return env._hop_extra_flight.float()
 
 
 def hop_landing_contact_cost(
