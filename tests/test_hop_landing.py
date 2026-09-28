@@ -287,3 +287,69 @@ def test_reward_param_curriculum_moves_every_named_term_together():
         v = microduck_mdp.reward_param_curriculum(env, None, list(GATED), stages)
         assert float(v) == scale
         assert all(t.params["dirty_landing_scale"] == scale for t in terms.values())
+
+
+# ── run 6: vertical first, forward only on measured clean landings ───────────
+
+from mjlab_microduck.tasks.microduck_hop_env_cfg import (  # noqa: E402
+    FORWARD_GATE_CLEAN_THRESHOLD,
+    FORWARD_GATE_MIN_DWELL_ITERS,
+    FORWARD_WEIGHT_STAGES,
+    MIDAIR_VX_RANGE,
+)
+
+_FWD = SimpleNamespace(weight=0.0)
+_SPAWN = SimpleNamespace(params={"midair_vx_range": (0.0, 0.0)})
+
+
+def _gate_env(n: int = 8) -> _Env:
+    env = _Env(n)
+    env.reward_manager = SimpleNamespace(get_term_cfg=lambda name: _FWD)
+    env.event_manager = SimpleNamespace(get_term_cfg=lambda name: _SPAWN)
+    return env
+
+
+def _gate(env, clean: bool, flew: bool = True, dwell=FORWARD_GATE_MIN_DWELL_ITERS * 24, alpha=1e-4):
+    env._hop_max_air_time[:] = HOP_MIN_AIR_TIME * (2.0 if flew else 0.0)
+    env._hop_landing_dirty[:] = not clean
+    return float(microduck_mdp.hop_forward_gate_curriculum(
+        env, torch.arange(env.num_envs), "hop_forward_progress", list(FORWARD_WEIGHT_STAGES),
+        "set_hop_state", MIDAIR_VX_RANGE, FORWARD_GATE_CLEAN_THRESHOLD, dwell,
+        HOP_MIN_AIR_TIME, alpha))
+
+
+def test_forward_objective_starts_closed_in_the_cfg():
+    cfg = make_microduck_hop_env_cfg()
+    assert cfg.rewards["hop_forward_progress"].weight == FORWARD_WEIGHT_STAGES[0] == 0.0
+    assert cfg.events["set_hop_state"].params["midair_vx_range"] == (0.0, 0.0)
+    p = cfg.curriculum["forward_gate"].params
+    assert p["weight_stages"][-1] == 5.0                  # the objective run 3 trained with
+    assert p["midair_vx_range"] == MIDAIR_VX_RANGE
+    assert p["event_name"] in cfg.events and p["reward_name"] in cfg.rewards
+
+
+def test_dirty_landings_and_no_flight_never_open_the_gate():
+    env = _gate_env()
+    for _ in range(2000):
+        env.common_step_counter += 24
+        assert _gate(env, clean=False) == 0.0             # the dive
+        assert _gate(env, clean=True, flew=False) == 0.0  # never took off
+    assert env._hop_clean_ema == 0.0 and _SPAWN.params["midair_vx_range"] == (0.0, 0.0)
+
+
+def test_clean_landings_open_one_stage_per_dwell_and_it_never_goes_back():
+    env = _gate_env()
+    dwell = FORWARD_GATE_MIN_DWELL_ITERS * 24
+    env.common_step_counter = dwell                       # first stage needs no extra wait
+    w = _gate(env, clean=True, alpha=0.5)                 # EMA jumps past the threshold
+    assert w == FORWARD_WEIGHT_STAGES[1]
+    assert _gate(env, clean=True, alpha=0.5) == FORWARD_WEIGHT_STAGES[1]   # dwell not yet over
+    env.common_step_counter += dwell
+    assert _gate(env, clean=True, alpha=0.5) == FORWARD_WEIGHT_STAGES[2]
+    frac = FORWARD_WEIGHT_STAGES[2] / FORWARD_WEIGHT_STAGES[-1]
+    assert _SPAWN.params["midair_vx_range"] == pytest.approx(
+        (MIDAIR_VX_RANGE[0] * frac, MIDAIR_VX_RANGE[1] * frac))
+    for _ in range(50):                                   # landings get worse again
+        env.common_step_counter += dwell
+        assert _gate(env, clean=False, alpha=0.5) == FORWARD_WEIGHT_STAGES[2]
+    assert _FWD.weight == FORWARD_WEIGHT_STAGES[2]

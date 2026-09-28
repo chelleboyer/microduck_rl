@@ -188,6 +188,19 @@ ENABLE_CLEAN_LANDING_GATE = True
 DIRTY_LANDING_SCALE_STAGES = ((0, 0.5), (300, 0.25), (600, 0.0))
 LANDING_CONTACT_COST_WEIGHT = -2.0
 
+# Vertical first, forward second (the plan's AC #3). Run 5 (W&B woqb8g63) had
+# the slope above and still landed chest-then-jaw in 32/32 eval episodes of
+# model_500: hop_forward_progress paid for the forward lean from step 0. With
+# the gate on, forward progress (and the mid-air spawn's forward speed) start
+# at ZERO and advance one stage at a time only when the EMA of clean landings
+# reaches FORWARD_GATE_CLEAN_THRESHOLD — measured progress, not the clock
+# (mdp.hop_forward_gate_curriculum). A clean vertical hop is achievable on this
+# robot: joanfox/microduck-happy-hop and the verified max-height jump do it.
+ENABLE_FORWARD_GATE = True
+FORWARD_WEIGHT_STAGES = (0.0, 1.5, 3.0, 5.0)   # last = the original fixed weight
+FORWARD_GATE_CLEAN_THRESHOLD = 0.30
+FORWARD_GATE_MIN_DWELL_ITERS = 100
+
 # ── Ranges (matched to the roulade/standup envs) ─────────────────────────────
 COM_RANDOMIZATION_RANGE             = 0.003   # ramped via curriculum
 HEAD_COM_RANDOMIZATION_RANGE        = 0.003   # ramped via curriculum
@@ -487,7 +500,8 @@ def make_microduck_hop_env_cfg(
     # a shuffle or walk-forward cannot farm this.
     cfg.rewards["hop_forward_progress"] = RewardTermCfg(
         func=microduck_mdp.hop_forward_progress,
-        weight=5.0,
+        # Starts at 0 behind the clean-landing gate (FORWARD_WEIGHT_STAGES).
+        weight=FORWARD_WEIGHT_STAGES[0] if ENABLE_FORWARD_GATE else FORWARD_WEIGHT_STAGES[-1],
         params={"target_distance": TARGET_FORWARD_DIST, "max_paid_rate": 1.0},
     )
 
@@ -767,7 +781,8 @@ def make_microduck_hop_env_cfg(
             "midair_z_min":      MIDAIR_Z_MIN,
             "midair_z_max":      MIDAIR_Z_MAX,
             "midair_vz_range":   MIDAIR_VZ_RANGE,
-            "midair_vx_range":   MIDAIR_VX_RANGE,
+            # Zero until the forward gate opens (hop_forward_gate_curriculum).
+            "midair_vx_range":   (0.0, 0.0) if ENABLE_FORWARD_GATE else MIDAIR_VX_RANGE,
             "joint_noise_std":   0.08,
             "gate_min_air_time": HOP_MIN_AIR_TIME,
         },
@@ -966,6 +981,20 @@ def make_microduck_hop_env_cfg(
             ],
         },
     )
+
+    if ENABLE_FORWARD_GATE:
+        cfg.curriculum["forward_gate"] = CurriculumTermCfg(
+            func=microduck_mdp.hop_forward_gate_curriculum,
+            params={
+                "reward_name":     "hop_forward_progress",
+                "weight_stages":   list(FORWARD_WEIGHT_STAGES),
+                "event_name":      "set_hop_state",
+                "midair_vx_range": MIDAIR_VX_RANGE,
+                "clean_threshold": FORWARD_GATE_CLEAN_THRESHOLD,
+                "min_dwell_steps": FORWARD_GATE_MIN_DWELL_ITERS * 24,
+                "min_air_time":    HOP_MIN_AIR_TIME,
+            },
+        )
 
     # One schedule for all three landing annuities: how much a dirty landing
     # still earns (see DIRTY_LANDING_SCALE_STAGES).

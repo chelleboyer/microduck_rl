@@ -3603,6 +3603,71 @@ def reward_weight(
     return torch.tensor([term_cfg.weight])
 
 
+def hop_forward_gate_curriculum(
+    env: ManagerBasedRlEnv,
+    env_ids: torch.Tensor,
+    reward_name: str,
+    weight_stages: list,
+    event_name: str,
+    midair_vx_range: tuple,
+    clean_threshold: float,
+    min_dwell_steps: int,
+    min_air_time: float = 0.06,
+    alpha_per_episode: float = 1e-4,
+) -> torch.Tensor:
+    """Vertical first, forward second: advance the forward objective only on
+    measured clean landings, never on the clock.
+
+    Run 5 (W&B woqb8g63, 2026-09-28) got liftoff in ~125 iterations but never
+    one clean landing: an eval of model_500 found the chest down ~0.2 s after
+    liftoff and the jaw propping the robot for ~0.3 s in 32/32 episodes.
+    hop_forward_progress (weight 5.0 from step 0) pays for exactly the forward
+    lean that ends in that dive. This is the plan's open AC #3.
+
+    Mechanism, called by the curriculum manager BEFORE reset events (mjlab
+    ``_reset_idx``), so the finishing episodes' latches are still intact:
+
+      * an episode counts as clean when a qualifying flight happened (or a
+        mid-air spawn's pre-seeded gate) and no non-foot body touched the
+        ground from then to the episode's end — AC #4's contact clause;
+      * the clean rate is an EMA over finished episodes, weighted per
+        episode (``alpha_per_episode``; 1e-4 ≈ 10k episodes ≈ 15 iterations
+        at 4096 envs), so batch size does not change its speed;
+      * the stage advances by ONE when the EMA reaches ``clean_threshold``
+        and at least ``min_dwell_steps`` have passed since the last advance.
+        It never goes back — a dip after a stage change is a pacing signal
+        to read in wandb, not something to oscillate on.
+
+    Each stage sets ``reward_name``'s weight to ``weight_stages[stage]`` and
+    scales the mid-air spawn's forward speed by the same fraction of the final
+    weight, so the landing practice gains forward momentum only as fast as the
+    objective that requires it. Returns the current weight (for logging).
+    """
+    _hop_state(env)
+    if not hasattr(env, "_hop_fwd_stage"):
+        env._hop_fwd_stage = 0
+        env._hop_fwd_stage_step = 0
+        env._hop_clean_ema = 0.0
+    if env_ids is not None and len(env_ids) > 0:
+        ids = env_ids.to(env._hop_landing_dirty.device, dtype=torch.long)
+        clean = (env._hop_max_air_time[ids] >= min_air_time) & ~env._hop_landing_dirty[ids]
+        n = len(ids)
+        a = 1.0 - (1.0 - alpha_per_episode) ** n
+        env._hop_clean_ema += a * (float(clean.float().mean()) - env._hop_clean_ema)
+    step = int(env.common_step_counter)
+    if (env._hop_fwd_stage < len(weight_stages) - 1
+            and env._hop_clean_ema >= clean_threshold
+            and step - env._hop_fwd_stage_step >= min_dwell_steps):
+        env._hop_fwd_stage += 1
+        env._hop_fwd_stage_step = step
+    weight = float(weight_stages[env._hop_fwd_stage])
+    env.reward_manager.get_term_cfg(reward_name).weight = weight
+    frac = weight / float(weight_stages[-1]) if weight_stages[-1] else 0.0
+    env.event_manager.get_term_cfg(event_name).params["midair_vx_range"] = (
+        midair_vx_range[0] * frac, midair_vx_range[1] * frac)
+    return torch.tensor(weight)
+
+
 def reward_param_curriculum(
     env: ManagerBasedRlEnv,
     env_ids: torch.Tensor,

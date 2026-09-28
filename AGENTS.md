@@ -55,11 +55,23 @@ State as of 2026-09-14:
   `clean_landing_rate` went 0.15 → 0.00 by iter 40 and stayed there; liftoff itself held. An
   all-or-nothing gate on a skill the policy does not have yet is invisible to PPO.
   **Read `clean_landing_rate` (AC #4's criterion), not `stable_landing_rate`.**
-- **Run 5 change (smoke-tested, not yet run):** keep the latch but give it a slope —
-  dirty landings keep `DIRTY_LANDING_SCALE_STAGES` of the annuities (0.5 → 0.25 → 0 at iters
-  0/300/600, via `reward_param_curriculum`), plus `hop_landing_contact_cost`, a per-step cost on
-  non-foot ground contact after liftoff (weight −2.0, sized so a dive-and-lie still earns less
-  than not hopping costs: hopping must keep beating not hopping). Fresh start, no warm start.
+- **Run 5 (W&B `woqb8g63`, fresh, 1000 iters): liftoff in ~125 iters, landing still a dive.**
+  Kept the latch but gave it a slope: dirty landings keep `DIRTY_LANDING_SCALE_STAGES` of the
+  annuities (0.5 → 0.25 → 0 at iters 0/300/600, `reward_param_curriculum`) plus
+  `hop_landing_contact_cost` (per-step non-foot contact after liftoff, weight −2.0, sized so
+  hopping still beats not hopping). The slope worked as a gradient — contact cost −0.80 → −0.30,
+  action std stable, both stage boundaries clean — but plateaued from ~iter 450 and
+  `clean_landing_rate` stayed 0.00. Per-body eval of model_500: `trunk_base` down ~0.2 s after
+  liftoff, then `jaw_soft` propping the robot ~0.3 s, 32/32 episodes. The policy shortened the
+  dive; it never changed HOW it lands.
+- **Run 6 change (smoke-tested, not yet run): vertical first, forward second** (the plan's AC #3).
+  `hop_forward_progress` was paying for the forward lean from step 0. `ENABLE_FORWARD_GATE`:
+  forward weight AND the mid-air spawn's forward speed start at 0 and advance one stage
+  (`FORWARD_WEIGHT_STAGES` 0 → 1.5 → 3 → 5) only when an EMA of clean landings reaches
+  `FORWARD_GATE_CLEAN_THRESHOLD` (0.30), at most once per 100 iters, never backwards
+  (`hop_forward_gate_curriculum` — measured progress, not the clock). Run 5's slope is kept.
+  Watch `Curriculum/forward_gate`: stuck at 0.0 means no clean vertical landing either, which
+  points at the landing itself, not the forward objective.
   `joanfox/microduck-happy-hop` (ONNX, vertical hop) was tested zero-shot in this env and is NOT a
   better warm start: ~10% AC #4, 50% non-foot contact, 20% never lift, backlash model no better.
 
