@@ -34,3 +34,36 @@ def test_rehearse_headless_half_second_no_nan():
     assert not s["nan"], f"NaN at control step {s['nan_step']}"
     assert s["control_steps"] == 25
     assert s["bam"] is True
+
+
+@pytest.mark.skipif(not os.path.exists(_ONNX), reason=f"policy ONNX not found: {_ONNX}")
+def test_training_delay_mode_runs_and_records_its_lag():
+    """--match-training-delays: substep actuator lag + joint_vel/IMU obs delays."""
+    rh = _load_script()
+    s = rh.run_rehearsal(_ONNX, seconds=0.5, match_training_delays=True, act_delay_substeps=5, seed=0)
+    assert not s["nan"] and s["obs_size"] == 61
+    assert s["training_delays"] and s["act_delay_substeps"] == 5
+    with pytest.raises(ValueError):
+        rh.run_rehearsal(_ONNX, seconds=0.1, match_training_delays=True, delay=[1])
+
+
+def test_joint_velocity_observation_is_one_step_late():
+    import numpy as np
+
+    class _P:
+        def __init__(self):
+            self.t = 0.0
+
+        def get_observations(self):
+            self.t += 1.0
+            return np.full(61, self.t, dtype=np.float32)
+
+    rh = _load_script()
+    p = _P()
+    rh._delay_observations(p, np.random.default_rng(0), 14)
+    first = p.get_observations()
+    second = p.get_observations()
+    qvel = slice(6 + 14, 6 + 28)
+    assert (first[qvel] == 1.0).all()            # nothing older yet: current
+    assert (second[qvel] == 1.0).all()           # one step late
+    assert (second[6:20] == 2.0).all()           # joint positions are not delayed

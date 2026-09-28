@@ -359,6 +359,13 @@ Never launch a long run without one.
   rotation speed.
 - IMU DR is zero-centered — it trains tolerance to misalignment magnitude, and
   CANNOT compensate a systematic mounting bias (that's a runtime calibration).
+- **Rehearse with training's latency, or the rehearsal lies.** `infer_policy.py` has no
+  actuator or observation delays, while training models them (BAM actuator 3–6 physics
+  substeps; `joint_vel` always 1 control step late; IMU 0–1 step). The run-6 bunny hop scored
+  1.33 hops/s and 75% clean landings without them, and 2.38 hops/s and 94% clean landings with
+  them, which matches training. No-display machines: `scripts/rehearse_headless.py
+  --match-training-delays --episodes N` (same sim path, no viewer). Corollary for hardware: the
+  real loop's latency must sit inside the trained envelope.
 - Real deployments hot-swap ONNX policies (walk / stand / trick) with a shared
   obs contract — rehearse in `scripts/infer_policy.py` before touching the
   robot, with the correct command-slot writes (a posture flag lives in the

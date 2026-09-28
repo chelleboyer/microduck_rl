@@ -166,12 +166,61 @@ def _floor_contact_state(model, data, floor_id, robot_geom, foot_geom):
     return any_robot, any_nonfoot
 
 
+# Training-matched delays (--match-training-delays). infer_policy.py's main()
+# has none of these, so a policy trained with them sees a different sensor/
+# actuator timing in the default rehearsal. Values mirror the training cfgs:
+#   actuator: microduck_constants.py BAM cfg delay_min_lag=3 / delay_max_lag=6
+#             PHYSICS substeps (5 ms each) — one lag per episode here;
+#   joint_vel: microduck_hop_env_cfg.py delay_min_lag = delay_max_lag = 1 control step;
+#   base_ang_vel / projected gravity: 0..1 control step, resampled every 64 steps.
+TRAIN_ACT_DELAY_SUBSTEPS = (3, 6)
+TRAIN_IMU_DELAY_STEPS = (0, 1)
+TRAIN_IMU_DELAY_PERIOD = 64
+OBS_ANG_VEL, OBS_GRAVITY = slice(0, 3), slice(3, 6)
+
+
+def _delay_observations(policy, rng, n_joints):
+    """Wrap policy.get_observations with training's per-term observation delays."""
+    qvel = slice(6 + n_joints, 6 + 2 * n_joints)
+    orig = policy.get_observations
+    hist = []
+    state = {"calls": 0, "imu_lag": 0}
+
+    def delayed():
+        raw = orig()
+        hist.append(raw.copy())
+        del hist[:-3]
+        if state["calls"] % TRAIN_IMU_DELAY_PERIOD == 0:
+            state["imu_lag"] = int(rng.integers(TRAIN_IMU_DELAY_STEPS[0], TRAIN_IMU_DELAY_STEPS[1] + 1))
+        state["calls"] += 1
+        out = raw.copy()
+        prev = hist[-2] if len(hist) >= 2 else raw           # joint_vel: always 1 step late
+        out[qvel] = prev[qvel]
+        imu = hist[-1 - state["imu_lag"]] if len(hist) > state["imu_lag"] else raw
+        out[OBS_ANG_VEL] = imu[OBS_ANG_VEL]
+        out[OBS_GRAVITY] = imu[OBS_GRAVITY]
+        return out
+
+    policy.get_observations = delayed
+
+
 def run_rehearsal(policy_path, seconds=6.0, scene=None, no_bam=False, video=None,
-                  delay=None, **bam_kwargs):
+                  delay=None, match_training_delays=False, act_delay_substeps=None,
+                  seed=None, **bam_kwargs):
     model, data, bam_ctrl, policy, xml_path = build_sim(
         policy_path, scene=scene, no_bam=no_bam, delay=delay, **bam_kwargs)
 
     obs_size = int(policy.get_observations().size)
+    act_lag = 0
+    if match_training_delays:
+        if delay:
+            raise ValueError("--delay (control-step action lag) and --match-training-delays are exclusive")
+        rng = np.random.default_rng(seed)
+        act_lag = int(act_delay_substeps if act_delay_substeps is not None
+                      else rng.integers(TRAIN_ACT_DELAY_SUBSTEPS[0], TRAIN_ACT_DELAY_SUBSTEPS[1] + 1))
+        _delay_observations(policy, rng, policy.n_joints)
+    pending = []      # (apply_at_substep, target positions) — substep-level actuator delay
+    substep = 0
     trunk_id = policy.trunk_base_id
     freejoint_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, "trunk_base_freejoint")
     qpos_adr = int(model.jnt_qposadr[freejoint_id])
@@ -217,11 +266,19 @@ def run_rehearsal(policy_path, seconds=6.0, scene=None, no_bam=False, video=None
         if not np.all(np.isfinite(action)):
             nan_step = step
             break
-        policy.apply_action(action)
+        if act_lag == 0:
+            policy.apply_action(action)
+        else:
+            # Same target as apply_action() (new_cmd_obs: no head offset), but
+            # it reaches the actuator act_lag PHYSICS substeps after issue.
+            pending.append((substep + act_lag, policy.default_pose + action * policy.action_scale))
         for _ in range(DECIMATION):
+            while pending and pending[0][0] <= substep:
+                policy.set_position_targets(pending.pop(0)[1])
             if bam_ctrl is not None:
                 bam_ctrl.update()
             mujoco.mj_step(model, data)
+            substep += 1
         if not (np.all(np.isfinite(data.qpos)) and np.all(np.isfinite(data.qvel))):
             nan_step = step
             break
@@ -275,6 +332,7 @@ def run_rehearsal(policy_path, seconds=6.0, scene=None, no_bam=False, video=None
         forward_speed_mps=fwd / sim_s if sim_s > 0 else float("nan"),
         ended_upright=bool(ct[-1] >= UPRIGHT_COS), final_cos_tilt=float(ct[-1]),
         nonfoot_steps=int(sum(nonfoot)),
+        training_delays=bool(match_training_delays), act_delay_substeps=act_lag,
     )
 
     if renderer is not None:
@@ -333,12 +391,54 @@ def main():
     p.add_argument("--vin-drop-gain", type=float, default=0.1)
     p.add_argument("--kp-fw", type=float, default=infer_policy.BAM_KP_FW)
     p.add_argument("--current-limit", type=float, default=0.0)
+    p.add_argument("--match-training-delays", action="store_true",
+                   help="Apply training's actuator delay (3-6 physics substeps) and observation "
+                        "delays (joint_vel 1 step, IMU 0-1 step). Off by default, like main().")
+    p.add_argument("--act-delay-substeps", type=int, default=None,
+                   help="With --match-training-delays: fix the actuator lag instead of sampling 3..6")
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--episodes", type=int, default=1,
+                   help="Run N rollouts (seeds seed..seed+N-1) and print an aggregate; no video")
     a = p.parse_args()
-    s = run_rehearsal(a.policy, seconds=a.seconds, scene=a.scene, no_bam=a.no_bam,
-                      video=a.video, delay=a.delay, vin=a.vin, vin_drop_gain=a.vin_drop_gain,
-                      kp_fw=a.kp_fw, current_limit=a.current_limit)
+    kw = dict(seconds=a.seconds, scene=a.scene, no_bam=a.no_bam, delay=a.delay, vin=a.vin,
+              vin_drop_gain=a.vin_drop_gain, kp_fw=a.kp_fw, current_limit=a.current_limit,
+              match_training_delays=a.match_training_delays,
+              act_delay_substeps=a.act_delay_substeps)
+    if a.episodes > 1:
+        runs = [run_rehearsal(a.policy, seed=a.seed + i, **kw) for i in range(a.episodes)]
+        print_aggregate(runs)
+        return 1 if any(r["nan"] for r in runs) else 0
+    s = run_rehearsal(a.policy, video=a.video, seed=a.seed, **kw)
     print_summary(s)
     return 1 if s["nan"] else 0
+
+
+def aggregate(runs):
+    """Pool N rollouts: rates over total sim time, landing cleanliness over all landings."""
+    t = sum(r["sim_seconds"] for r in runs)
+    landings = sum(r["landings"] for r in runs)
+    durs = [d for r in runs for d in r["flight_durations_s"]]
+    return dict(
+        rollouts=len(runs), sim_seconds=t, nan_rollouts=sum(r["nan"] for r in runs),
+        flights_per_s=sum(r["flights"] for r in runs) / t if t else float("nan"),
+        feet_only_landing_frac=(landings - sum(r["dirty_landings"] for r in runs)) / landings
+        if landings else float("nan"),
+        flight_s_median=float(np.median(durs)) if durs else float("nan"),
+        forward_speed_mps=sum(r["forward_disp_m"] for r in runs) / t if t else float("nan"),
+        ended_upright_frac=sum(r["ended_upright"] for r in runs) / len(runs),
+        max_tilt_deg_worst=max(r["max_tilt_deg"] for r in runs),
+        act_delay_substeps=sorted({r["act_delay_substeps"] for r in runs}),
+    )
+
+
+def print_aggregate(runs):
+    print("\n" + "=" * 72)
+    print(f"Headless rehearsal aggregate ({len(runs)} rollouts, "
+          f"{'training delays' if runs[0]['training_delays'] else 'no delays'}, "
+          f"{'BAM M6' if runs[0]['bam'] else 'XML position'})")
+    print("=" * 72)
+    for k, v in aggregate(runs).items():
+        print(f"{k:<24s}: {v:.4g}" if isinstance(v, float) else f"{k:<24s}: {v}")
 
 
 if __name__ == "__main__":
