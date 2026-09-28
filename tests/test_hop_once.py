@@ -111,3 +111,32 @@ def test_the_once_latch_is_step_guarded():
     env._hop_extra_flight[:] = False
     microduck_mdp._update_hop_landed_once(env, HOP_MIN_AIR_TIME)  # same step: no-op
     assert not bool(env._hop_extra_flight[0])
+
+
+# ── v2: take-off terms pay only until the first landing ──────────────────────
+
+from mjlab_microduck.tasks.microduck_hop_env_cfg import ONCE_FIRST_FLIGHT_ONLY_TERMS  # noqa: E402
+
+
+def test_once_pays_take_off_only_for_the_first_flight():
+    once = make_microduck_hop_env_cfg(once=True)
+    plain = make_microduck_hop_env_cfg()
+    bunny = make_microduck_hop_env_cfg(perpetual=True)
+    assert set(ONCE_FIRST_FLIGHT_ONLY_TERMS) == {
+        "hop_unweighting", "hop_launch_velocity", "hop_air_time", "hop_forward_progress"}
+    for name in ONCE_FIRST_FLIGHT_ONLY_TERMS:
+        assert once.rewards[name].params["first_flight_only"] is True, name
+        # the hop and the bunny hop must keep paying every flight
+        assert "first_flight_only" not in plain.rewards[name].params, name
+        assert "first_flight_only" not in bunny.rewards[name].params, name
+
+
+def test_the_first_landing_zeroes_take_off_pay_but_not_before():
+    env = _Env()
+    assert microduck_mdp._hop_before_first_landing(env, False) == 1.0   # disabled: bit-identical
+    _step(env, airborne=True)                                          # the hop, gate open
+    assert float(microduck_mdp._hop_before_first_landing(env, True)[0]) == 1.0
+    _step(env, airborne=False)                                         # first touchdown
+    assert float(microduck_mdp._hop_before_first_landing(env, True)[0]) == 0.0
+    _step(env, airborne=True)                                          # a re-hop earns nothing
+    assert float(microduck_mdp._hop_before_first_landing(env, True)[0]) == 0.0

@@ -220,6 +220,8 @@ FORWARD_GATE_MIN_DWELL_ITERS = 100
 # the right polish for "stick the landing". The two curricula run 6 finished
 # (forward gate, dirty-landing scale) are collapsed to their final stage here.
 ONCE_EXTRA_FLIGHT_WEIGHT = -4.0
+ONCE_FIRST_FLIGHT_ONLY_TERMS = ("hop_unweighting", "hop_launch_velocity", "hop_air_time",
+                                "hop_forward_progress")
 
 # ── BunnyHop: perpetual forward bunny hop (make_microduck_hop_env_cfg(perpetual=True)) ─
 # Run 6's continuous hop, published as chelleboyer/microduck-bunny-hop, FALLS:
@@ -1081,6 +1083,13 @@ def make_microduck_hop_env_cfg(
             weight=ONCE_EXTRA_FLIGHT_WEIGHT,
             params={"min_air_time": HOP_MIN_AIR_TIME},
         )
+        # v2: the take-off terms pay only until the first landing. v1 (W&B
+        # asfkt0rq) left them live, and its per-phase reward breakdown showed
+        # re-hops still earning hop_air_time / hop_forward_progress: they are
+        # best-so-far frontiers, so each re-hop that beat a modest first flight
+        # was paid (mdp._hop_before_first_landing).
+        for name in ONCE_FIRST_FLIGHT_ONLY_TERMS:
+            cfg.rewards[name].params["first_flight_only"] = True
         cfg.metrics["extra_flight_rate"] = MetricsTermCfg(
             func=microduck_mdp.hop_metric_extra_flight,
             params={"min_air_time": HOP_MIN_AIR_TIME},

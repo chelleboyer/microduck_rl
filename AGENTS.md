@@ -87,7 +87,8 @@ State as of 2026-09-14:
   - **`Mjlab-HopOnce`** (`once=True`, W&B `asfkt0rq`) halved re-hops (~10 → ~5 per episode) but
     did not stop them. A per-phase reward breakdown showed why: `hop_air_time` and
     `hop_forward_progress` are best-so-far frontiers, so each re-hop that beats the first flight
-    is PAID. Fix (not yet built): pay take-off terms only until the first landing.
+    is PAID. **v2** (`ONCE_FIRST_FLIGHT_ONLY_TERMS`, `_hop_before_first_landing`): take-off
+    terms pay only until the first landing, so a re-hop nets about −3.8/step against +2.1 for standing.
 - **Run 6 design: vertical first, forward second** (the plan's AC #3).
   `hop_forward_progress` was paying for the forward lean from step 0. `ENABLE_FORWARD_GATE`:
   forward weight AND the mid-air spawn's forward speed start at 0 and advance one stage

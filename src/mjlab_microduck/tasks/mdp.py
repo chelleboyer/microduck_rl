@@ -7951,6 +7951,7 @@ def hop_unweighting_bonus(
     env: ManagerBasedRlEnv,
     sensor_name: str = "feet_ground_contact",
     force_norm: float = 8.0,
+    first_flight_only: bool = False,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
     """Dense discovery shaping: rising CoM velocity while both feet unweight.
@@ -7974,7 +7975,8 @@ def hop_unweighting_bonus(
     bonus = torch.clamp(vz, min=0.0) * unweighted
     # Clean-gated too: a butt-bounce's rising CoM velocity while its feet
     # happen to unweight must not earn the discovery-precursor bonus either.
-    return torch.where(_hop_is_clean(env), bonus, torch.zeros_like(bonus))
+    return torch.where(_hop_is_clean(env), bonus, torch.zeros_like(bonus)) * _hop_before_first_landing(
+        env, first_flight_only)
 
 
 def hop_air_time_progress(
@@ -7982,6 +7984,7 @@ def hop_air_time_progress(
     target_air_time: float = 0.15,
     max_paid_rate: float = 1.0,
     sensor_name: str = "feet_ground_contact",
+    first_flight_only: bool = False,
 ) -> torch.Tensor:
     """Pay increments of the simultaneous-air-time frontier, up to a target.
 
@@ -7997,7 +8000,7 @@ def hop_air_time_progress(
     delta = torch.clamp(new_paid - torch.clamp(paid, max=target_air_time), min=0.0)
     delta = torch.clamp(delta, max=max_paid_rate * env.step_dt)
     env._hop_paid = torch.maximum(paid, new_paid)
-    return delta / (env.step_dt * target_air_time)
+    return delta / (env.step_dt * target_air_time) * _hop_before_first_landing(env, first_flight_only)
 
 
 def _update_hop_forward_accum(env: ManagerBasedRlEnv, sensor_name: str = "feet_ground_contact") -> None:
@@ -8069,6 +8072,7 @@ def hop_forward_progress(
     target_distance: float = 0.08,
     max_paid_rate: float = 1.0,
     sensor_name: str = "feet_ground_contact",
+    first_flight_only: bool = False,
 ) -> torch.Tensor:
     """Pay increments of the airborne-forward-displacement frontier, up to a target.
 
@@ -8088,7 +8092,7 @@ def hop_forward_progress(
     delta = torch.clamp(new_paid - torch.clamp(paid, max=target_distance), min=0.0)
     delta = torch.clamp(delta, max=max_paid_rate * env.step_dt)
     env._hop_fwd_paid = torch.maximum(paid, new_paid)
-    return delta / (env.step_dt * target_distance)
+    return delta / (env.step_dt * target_distance) * _hop_before_first_landing(env, first_flight_only)
 
 
 _HOP_STANCES = ("left", "right")
@@ -8270,6 +8274,28 @@ def hop_metric_extra_flight(env: ManagerBasedRlEnv, min_air_time: float = 0.06) 
     _update_hop_accum(env)
     _update_hop_landed_once(env, min_air_time)
     return env._hop_extra_flight.float()
+
+
+def _hop_before_first_landing(env: ManagerBasedRlEnv, enabled: bool,
+                              min_air_time: float = 0.06):
+    """Multiplier for the take-off terms in Mjlab-HopOnce: 0 after the first landing.
+
+    HopOnce v1 (W&B asfkt0rq) halved re-hops but never stopped them. A
+    per-phase reward breakdown of its final checkpoint found why: during a
+    re-hop the policy still earned hop_air_time (~1.2/step) and
+    hop_forward_progress (~2.2/step). Those are best-so-far frontiers, so a
+    modest first hop followed by re-hops that beat it collects the
+    difference, and the extra-flight cost only partly offset it. With this
+    gate the first flight is the only one that can earn take-off pay. Only
+    the PAYOUT is zeroed: the frontiers keep updating, because the
+    completion gate reads the air-time frontier.
+
+    1.0 (a plain float) when disabled, so other tasks are bit-identical.
+    """
+    if not enabled:
+        return 1.0
+    _update_hop_landed_once(env, min_air_time)
+    return (~env._hop_landed_once).float()
 
 
 def hop_landing_contact_cost(
@@ -8492,6 +8518,7 @@ def hop_launch_velocity_progress(
     target_velocity: float = 0.60,
     max_paid_rate: float = 1.0,
     sensor_name: str = "feet_ground_contact",
+    first_flight_only: bool = False,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
     """Pay increments of the max upward velocity reached WHILE STILL LOADED.
@@ -8545,7 +8572,7 @@ def hop_launch_velocity_progress(
     delta = torch.clamp(new_paid - torch.clamp(paid, max=target_velocity), min=0.0)
     delta = torch.clamp(delta, max=max_paid_rate * env.step_dt)
     env._hop_launch_vz_paid = torch.maximum(paid, new_paid)
-    return delta / (env.step_dt * target_velocity)
+    return delta / (env.step_dt * target_velocity) * _hop_before_first_landing(env, first_flight_only)
 
 
 def hop_airborne_tilt_penalty(
