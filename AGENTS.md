@@ -41,6 +41,19 @@ State as of 2026-09-14:
   attitude penalty, and a `cfg.metrics` block — are implemented (`17f5e63`). All five structural
   defects are now closed; the rest of the plan's Phase 2 (AC #3: reducing run 3 to one question)
   is still open. Suite green at 266.
+- **Run 3 (2026-09-28, W&B `chelleboyer-road-ranger/mjlab_microduck/rv0u6ot4`, 1000 iters):
+  liftoff is discoverable** — valid_takeoff_rate 1.0, 0.17 s air, 32 mm CoM rise. **But it is a
+  dive**: `scripts/eval_hop.py` on model_750 found non-foot contact (trunk_base, jaw_soft) in
+  128/128 episodes, standing AND crouch spawns, 0% AC #4 — while `stable_landing_rate` read 0.98,
+  because it only checks the final step. Cause: `_hop_completion_gate` stays open after liftoff,
+  so standing back up after a face-plant collected the full landing annuity.
+- **Run 4 change (drafted, not yet run):** `ENABLE_CLEAN_LANDING_GATE` — landing annuities pay 0
+  once any non-foot body touches the ground after the gate opens (`_update_hop_landing_clean`;
+  NOT the old sticky taint — it cannot fire before a flight and leaves take-off terms paid), plus
+  a `clean_landing_rate` metric (AC #4's criterion). **Read `clean_landing_rate`, not
+  `stable_landing_rate`.** Warm-start from rv0u6ot4 `model_999.pt` via `--wandb-run-path`.
+  `joanfox/microduck-happy-hop` (ONNX, vertical hop) was tested zero-shot in this env and is NOT a
+  better warm start: ~10% AC #4, 50% non-foot contact, 20% never lift, backlash model no better.
 
 **Prior art worth reading before touching the hop:** the community policy
 `ThomasBurgess2000/microduck-max-height-jump` (GitHub) trains `Mjlab-Jump-Flat-MicroDuck` on the
@@ -257,7 +270,12 @@ Never launch a long run without one.
 
 ## Training ops & reading a run
 
-- wandb project `mjlab_microduck`; logs in `logs/<experiment_name>/`; resume
+- **Every `train` records video by default** (`train_hook.default_video_on` appends
+  `--video True`; opt out with `--video False` or `MICRODUCK_NO_VIDEO=1`). mp4s land in
+  `<run>/videos/train/`, are pushed to W&B as `Video/train` by `MicroduckOnPolicyRunner`, and are
+  mirrored into the HF checkpoint repo by the Jobs uploader. Watch them.
+- wandb project `mjlab_microduck` under entity `chelleboyer-road-ranger` (the username
+  `chelleboyer` is refused as a run entity — pass `WANDB_ENTITY`); logs in `logs/<experiment_name>/`; resume
   with `--agent.load-checkpoint model_XXXX.pt --agent.resume True`.
 - **Warm start ≠ resume.** mjlab's runner stores `common_step_counter` in the
   checkpoint and restores it (plus the iteration) on load, so loading another

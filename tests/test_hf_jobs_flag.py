@@ -233,7 +233,9 @@ def test_both_train_shims_reach_the_hook_before_parsing_argv(shim):
         f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr[-2000:]}"
     )
     assert proc.returncode == 0, f"probe failed:\n{proc.stderr[-2000:]}"
-    assert f"SUBMIT ['{_TASK}', '--env.scene.num-envs', '4096']" in proc.stdout
+    # `--video True` is the recording default (train_hook.default_video_on),
+    # appended before the submit so the job records too.
+    assert f"SUBMIT ['{_TASK}', '--env.scene.num-envs', '4096', '--video', 'True']" in proc.stdout
     assert "EXIT 7" in proc.stdout
 
 

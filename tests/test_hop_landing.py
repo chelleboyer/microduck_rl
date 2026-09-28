@@ -82,7 +82,10 @@ class _Env:
         self.device = "cpu"
         self.common_step_counter = 0
         self.feet = SimpleNamespace(data=SimpleNamespace(found=torch.ones(n, 2)))
-        self.scene = SimpleNamespace(sensors={"feet_ground_contact": self.feet})
+        # 13 non-foot bodies, as on the compiled groundcontact model.
+        self.nonfoot = SimpleNamespace(data=SimpleNamespace(found=torch.zeros(n, 13)))
+        self.scene = SimpleNamespace(sensors={"feet_ground_contact": self.feet,
+                                              "nonfoot_ground_contact": self.nonfoot})
         _hop_state(self)
 
     def open_gate(self):
@@ -144,3 +147,73 @@ def test_two_foot_task_multiplier_is_one():
 def test_stance_names_are_checked():
     with pytest.raises(AssertionError):
         hop_landing_stance_factor(_Env(), "both", HOP_MIN_AIR_TIME)
+
+
+# ── the clean-landing gate (run 3's dive-and-face-plant) ────────────────────
+
+@pytest.mark.parametrize("landing", ["both", "left", "right"])
+def test_every_landing_variant_requires_a_clean_landing(landing):
+    cfg = make_microduck_hop_env_cfg(landing=landing)
+    for name in GATED:
+        assert cfg.rewards[name].params["require_clean_landing"] is True, name
+    # Take-off terms are paid at liftoff and must not be touched by the gate:
+    # a hop that lands badly has to keep beating not hopping at all.
+    for name in ("hop_unweighting", "hop_launch_velocity", "hop_air_time", "hop_forward_progress"):
+        assert "require_clean_landing" not in cfg.rewards[name].params, name
+    assert "clean_landing_rate" in cfg.metrics
+    assert cfg.metrics["clean_landing_rate"].reduce == "last"
+    if landing == "both":
+        assert "stance" not in cfg.metrics["clean_landing_rate"].params
+    else:
+        assert cfg.metrics["clean_landing_rate"].params["stance"] == landing
+
+
+def _clean(env: _Env, nonfoot_touching: bool) -> float:
+    env.common_step_counter += 1
+    env.nonfoot.data.found = torch.zeros(1, 13)
+    if nonfoot_touching:
+        env.nonfoot.data.found[0, 1] = 1.0          # e.g. trunk_base / jaw_soft
+    return float(microduck_mdp._hop_clean_landing(env, True, HOP_MIN_AIR_TIME))
+
+
+def test_contact_before_any_flight_does_not_latch():
+    # A pre-hop fall is the clean-time clock's business, not this latch's —
+    # latching here would be the sticky taint that made "do nothing" win.
+    env = _Env()
+    assert _clean(env, True) == 1.0
+    assert not bool(env._hop_landing_dirty[0])
+
+
+def test_a_feet_only_landing_keeps_paying():
+    env = _Env()
+    env.open_gate()
+    for _ in range(5):
+        assert _clean(env, False) == 1.0
+
+
+def test_a_dirty_landing_zeroes_the_rest_of_the_episode():
+    env = _Env()
+    env.open_gate()
+    assert _clean(env, False) == 1.0                # flight
+    assert _clean(env, True) == 0.0                 # chest / jaw hits the floor
+    assert _clean(env, False) == 0.0                # standing back up earns nothing
+    assert _clean(env, False) == 0.0
+
+
+def test_the_clean_landing_latch_is_step_guarded():
+    env = _Env()
+    env.open_gate()
+    env.common_step_counter += 1
+    env.nonfoot.data.found = torch.ones(1, 13)
+    microduck_mdp._update_hop_landing_clean(env, HOP_MIN_AIR_TIME)       # latches this step
+    env.nonfoot.data.found = torch.zeros(1, 13)
+    microduck_mdp._update_hop_landing_clean(env, HOP_MIN_AIR_TIME)       # same step: no-op
+    assert bool(env._hop_landing_dirty[0])
+
+
+def test_the_gate_off_is_bit_identical():
+    env = _Env()
+    env.open_gate()
+    env.nonfoot.data.found = torch.ones(1, 13)
+    assert microduck_mdp._hop_clean_landing(env, False, HOP_MIN_AIR_TIME) == 1.0
+    assert not bool(env._hop_landing_dirty[0])      # not even evaluated

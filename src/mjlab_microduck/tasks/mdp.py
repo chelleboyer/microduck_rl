@@ -7480,6 +7480,10 @@ def _hop_state(env: ManagerBasedRlEnv) -> tuple:
         env._hop_td_latched = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
         env._hop_td_clean = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
         env._hop_last_td_step = -1
+        # Clean-landing latch (_update_hop_landing_clean): set the first time
+        # a non-foot body touches the ground after the completion gate opens.
+        env._hop_landing_dirty = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+        env._hop_last_landing_step = -1
     return env._hop_max_air_time, env._hop_paid, env._hop_completed
 
 
@@ -7841,6 +7845,7 @@ def reset_hop_state(
     env._hop_max_com_rise[env_ids] = 0.0
     env._hop_td_latched[env_ids] = False
     env._hop_td_clean[env_ids] = False
+    env._hop_landing_dirty[env_ids] = False
     env._hop_max_foot_rise[env_ids] = 0.0
 
 
@@ -8041,6 +8046,64 @@ def _hop_stance(env: ManagerBasedRlEnv, stance: Optional[str], min_air_time: flo
     return hop_landing_stance_factor(env, stance, min_air_time)
 
 
+def _update_hop_landing_clean(
+    env: ManagerBasedRlEnv,
+    min_air_time: float,
+    sensor_name: str = "nonfoot_ground_contact",
+) -> None:
+    """Latch the episode DIRTY on any non-foot ground contact after liftoff.
+
+    Closes the dive-and-face-plant found in run 3 (2026-09-28, W&B rv0u6ot4):
+    the policy took off cleanly (0.17 s of feet-only flight, so the clean-time
+    clock paid the air time in full), landed trunk-first and jaw-first in
+    128/128 eval episodes, stood back up, and then collected the whole landing
+    annuity anyway — _hop_completion_gate stays open for the rest of the
+    episode, and nothing downstream of it looked at HOW the robot came down.
+    stable_landing_rate read 0.98 because it only checks the final step.
+
+    This is AC #4's own "no non-foot body touched the ground" clause,
+    applied from the moment the gate opens: the flight, the touchdown, and
+    everything after it. It is NOT the sticky ground taint removed on
+    2026-09-13 (see _update_hop_clean_time), which latched BEFORE any hop,
+    zeroed every positive term including air time, and made "do nothing" the
+    argmax. This one:
+
+      * cannot fire before a qualifying flight (or a mid-air spawn's
+        pre-seeded gate), so it never taxes an attempt;
+      * zeroes only the landing annuities — air time, launch velocity and
+        forward progress are paid at liftoff and are untouched, so a hop
+        that face-plants still beats not hopping, and a clean hop strictly
+        beats a dirty one;
+      * pays nothing for standing back up after a dirty landing, which is
+        the point: recovery was being paid as if it were the landing.
+
+    Step-guarded like the other hop latches.
+    """
+    _hop_state(env)
+    step = int(env.common_step_counter)
+    if step == env._hop_last_landing_step:
+        return
+    env._hop_last_landing_step = step
+    if sensor_name not in env.scene.sensors:
+        return
+    found = env.scene.sensors[sensor_name].data.found
+    touching = torch.nan_to_num(found, nan=0.0).reshape(found.shape[0], -1).any(dim=-1)
+    gate_open = _hop_completion_gate(env, min_air_time) > 0.0
+    env._hop_landing_dirty = env._hop_landing_dirty | (gate_open & touching)
+
+
+def _hop_clean_landing(env: ManagerBasedRlEnv, require: bool, min_air_time: float):
+    """Multiplier for the landing terms: 0 once the landing latched dirty.
+
+    1.0 (a plain float, as _hop_stance returns) when not required, so the
+    terms are bit-identical to before for any cfg that leaves it off.
+    """
+    if not require:
+        return 1.0
+    _update_hop_landing_clean(env, min_air_time)
+    return (~env._hop_landing_dirty).float()
+
+
 def hop_landing_composite(
     env: ManagerBasedRlEnv,
     target_height: float,
@@ -8051,6 +8114,7 @@ def hop_landing_composite(
     min_air_time: float = 0.06,
     target_overrides: Optional[dict] = None,
     stance: Optional[str] = None,
+    require_clean_landing: bool = False,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
     """standing_composite_score × completion gate — the landing/recovery annuity.
@@ -8060,6 +8124,8 @@ def hop_landing_composite(
     threshold. ``stance`` ("left" / "right", the one-foot hopscotch landings)
     additionally multiplies by hop_landing_stance_factor; None (the two-foot
     Mjlab-Hop task) leaves this term exactly as it was.
+    ``require_clean_landing`` additionally zeroes it once any non-foot body
+    has touched the ground since liftoff (_update_hop_landing_clean).
     """
     asset: Entity = env.scene[asset_cfg.name]
     _update_hop_accum(env)
@@ -8073,13 +8139,15 @@ def hop_landing_composite(
         target_overrides=target_overrides,
         asset_cfg=asset_cfg,
     )
-    return score * _hop_completion_gate(env, min_air_time) * _hop_stance(env, stance, min_air_time)
+    return (score * _hop_completion_gate(env, min_air_time) * _hop_stance(env, stance, min_air_time)
+            * _hop_clean_landing(env, require_clean_landing, min_air_time))
 
 
 def hop_upright_after_landing(
     env: ManagerBasedRlEnv,
     min_air_time: float = 0.06,
     stance: Optional[str] = None,
+    require_clean_landing: bool = False,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
     """Linear cos(tilt) × completion gate — bootstrap pull toward vertical."""
@@ -8088,7 +8156,8 @@ def hop_upright_after_landing(
     quat = asset.data.root_link_quat_w
     upright = 1.0 - 2.0 * (quat[:, 1].pow(2) + quat[:, 2].pow(2))
     return (torch.clamp(upright, min=0.0) * _hop_completion_gate(env, min_air_time)
-            * _hop_stance(env, stance, min_air_time))
+            * _hop_stance(env, stance, min_air_time)
+            * _hop_clean_landing(env, require_clean_landing, min_air_time))
 
 
 def hop_height_after_landing(
@@ -8097,6 +8166,7 @@ def hop_height_after_landing(
     std: float = 0.04,
     min_air_time: float = 0.06,
     stance: Optional[str] = None,
+    require_clean_landing: bool = False,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
     """Broad height Gaussian × completion gate — pull up to standing height."""
@@ -8106,7 +8176,8 @@ def hop_height_after_landing(
         asset.data.root_link_pos_w[:, 2] - env.scene.terrain.env_origins[:, 2], nan=0.0
     )
     g = torch.exp(-((z - target_height) / std) ** 2)
-    return g * _hop_completion_gate(env, min_air_time) * _hop_stance(env, stance, min_air_time)
+    return (g * _hop_completion_gate(env, min_air_time) * _hop_stance(env, stance, min_air_time)
+            * _hop_clean_landing(env, require_clean_landing, min_air_time))
 
 
 def hop_stand_tax(
@@ -8521,3 +8592,31 @@ def hop_metric_stable_landing(
         & ~nf_touching
     )
     return ok.float() * _hop_stance(env, stance, min_air_time)
+
+
+def hop_metric_clean_landing(
+    env: ManagerBasedRlEnv,
+    target_height: float,
+    min_air_time: float = 0.06,
+    height_tol: float = 0.02,
+    upright_min: float = 0.9,
+    stance: Optional[str] = None,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """stable_landing AND no non-foot ground contact at ANY point since liftoff.
+
+    hop_metric_stable_landing checks non-foot contact only on the step it is
+    read (reduce="last": the final one), so a robot that face-planted and
+    then stood back up scores 1.0 there — run 3 logged 0.98 while an eval of
+    the same policy found non-foot contact in 128/128 episodes. This reads
+    the clean-landing latch as well, which is AC #4's criterion. Kept as a
+    separate metric so stable_landing_rate stays comparable across runs.
+    As with valid_takeoff_rate, mid-air spawns count: their gate is
+    pre-seeded, so they are judged on the touchdown they were spawned into.
+    """
+    ok = hop_metric_stable_landing(
+        env, target_height=target_height, min_air_time=min_air_time,
+        height_tol=height_tol, upright_min=upright_min, stance=stance, asset_cfg=asset_cfg,
+    )
+    _update_hop_landing_clean(env, min_air_time)
+    return ok * (~env._hop_landing_dirty).float()

@@ -166,6 +166,12 @@ ENABLE_VELOCITY_PUSHES               = False  # a push mid-hop is incoherent
 ENABLE_IMU_ORIENTATION_RANDOMIZATION = True
 ENABLE_ENCODER_BIAS                  = True
 
+# Landing annuities pay nothing once any non-foot body has touched the ground
+# since liftoff (mdp._update_hop_landing_clean). Run 3 (W&B rv0u6ot4) learned
+# a dive that lands trunk- and jaw-first in 128/128 eval episodes and was paid
+# the full landing stack for standing back up afterwards.
+ENABLE_CLEAN_LANDING_GATE = True
+
 # ── Ranges (matched to the roulade/standup envs) ─────────────────────────────
 COM_RANDOMIZATION_RANGE             = 0.003   # ramped via curriculum
 HEAD_COM_RANDOMIZATION_RANGE        = 0.003   # ramped via curriculum
@@ -493,10 +499,11 @@ def make_microduck_hop_env_cfg(
         weight=1.0,
         params={"target_height": STAND_Z, "std": 0.04, "min_air_time": HOP_MIN_AIR_TIME},
     )
-    if stance is not None:
-        for name in ("hop_landing_composite", "hop_upright_after_landing",
-                     "hop_height_after_landing"):
+    for name in ("hop_landing_composite", "hop_upright_after_landing",
+                 "hop_height_after_landing"):
+        if stance is not None:
             cfg.rewards[name].params["stance"] = stance
+        cfg.rewards[name].params["require_clean_landing"] = ENABLE_CLEAN_LANDING_GATE
 
     cfg.rewards["hop_stand_tax"] = RewardTermCfg(
         func=microduck_mdp.hop_stand_tax,
@@ -596,8 +603,17 @@ def make_microduck_hop_env_cfg(
         params={"target_height": STAND_Z, "min_air_time": HOP_MIN_AIR_TIME},
         reduce="last",
     )
+    # The acceptance-bar metric: stable_landing_rate AND no non-foot contact at
+    # any point since liftoff. stable_landing_rate alone read 0.98 on run 3
+    # while every eval episode face-planted — read THIS one for AC #4.
+    cfg.metrics["clean_landing_rate"] = MetricsTermCfg(
+        func=microduck_mdp.hop_metric_clean_landing,
+        params={"target_height": STAND_Z, "min_air_time": HOP_MIN_AIR_TIME},
+        reduce="last",
+    )
     if stance is not None:
         cfg.metrics["stable_landing_rate"].params["stance"] = stance
+        cfg.metrics["clean_landing_rate"].params["stance"] = stance
 
     # Always-on upright would oppose the push-off/flight phase; landing
     # uprightness is handled by the completion-gated terms above.

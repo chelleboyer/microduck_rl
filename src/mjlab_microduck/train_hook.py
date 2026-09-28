@@ -44,6 +44,36 @@ def _invoked_as_train() -> bool:
     return prog.removesuffix(".py").removesuffix("-script") == "train"
 
 
+#: Opt-out for the video default below, e.g. a CPU box with no EGL/GL at all.
+_NO_VIDEO_ENV = "MICRODUCK_NO_VIDEO"
+
+
+def default_video_on() -> None:
+    """Make `train` record videos unless the caller said otherwise.
+
+    mjlab's TrainConfig defaults `video=False`, and it lives in site-packages,
+    so the default is flipped here, on the same import path as --hf-jobs.
+    Every run should leave something to WATCH: AGENTS.md — "Sim metrics can
+    pass while the video fails the human eye." Run 3 of the hop (2026-09-28)
+    logged stable_landing_rate 0.98 while every eval episode face-planted,
+    and there was no training video to catch it.
+
+    Runs BEFORE maybe_submit_to_hf_jobs, so the flag rides along in the argv
+    that `--hf-jobs` forwards to the job; inside the job the flag is already
+    present and this is a no-op. Opt out with an explicit `--video False` or
+    MICRODUCK_NO_VIDEO=1. Syntax is `--video True`: mjlab parses with
+    tyro.conf.FlagConversionOff, so a bare `--video` is not a flag.
+    """
+    if not _invoked_as_train() or os.environ.get(_NO_VIDEO_ENV) == "1":
+        return
+    args = sys.argv[1:]
+    if any(a == "--video" or a.startswith("--video=") for a in args):
+        return
+    if len(args) == 0 or args[0].startswith("-"):
+        return  # `train --help` or no task: leave mjlab's own CLI errors alone
+    sys.argv[1:] = [*args, "--video", "True"]
+
+
 def maybe_submit_to_hf_jobs() -> None:
     """Consume `--hf-jobs` and exit the process; a no-op without the flag.
 

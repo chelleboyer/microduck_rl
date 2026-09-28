@@ -1,4 +1,10 @@
-from mjlab_microduck.train_hook import maybe_submit_to_hf_jobs
+from pathlib import Path
+
+from mjlab_microduck.train_hook import default_video_on, maybe_submit_to_hf_jobs
+
+# Every `train` records videos unless told not to (train_hook.default_video_on).
+# Must run before the submit below so the flag is forwarded to HF Jobs.
+default_video_on()
 
 # `train <task> ... --hf-jobs` submits to HF Jobs and exits here, before any
 # of the cfg imports below: this module is what mjlab's plugin loader pulls
@@ -21,6 +27,43 @@ class MicroduckOnPolicyRunner(VelocityOnPolicyRunner):
         sym = alg.get("symmetry_cfg") if isinstance(alg, dict) else None
         if isinstance(sym, dict) and "_env" in sym:
             alg["symmetry_cfg"] = {k: v for k, v in sym.items() if k != "_env"}
+        _log_training_videos_to_wandb(self.logger)
+
+
+def _log_training_videos_to_wandb(logger) -> None:
+    """After each logged iteration, push any new `videos/train/*.mp4` to W&B.
+
+    mjlab's `train --video True` only writes mp4s into the run dir; neither
+    mjlab nor rsl_rl ever sends them to W&B, so a recorded video was
+    invisible unless someone went and fetched the run dir. VideoRecorder
+    writes each file in one call on the training thread, before the next
+    iteration is logged, so every file seen here is complete. Logged at the
+    iteration's own step (the same step rsl_rl's scalars use).
+
+    Never allowed to kill a run: a failed upload prints and is not retried.
+    """
+    orig_log = logger.log
+    seen: set[Path] = set()
+
+    def log(*args, **kwargs):
+        orig_log(*args, **kwargs)
+        if getattr(logger, "logger_type", None) != "wandb" or logger.log_dir is None:
+            return
+        it = kwargs.get("it", args[0] if args else None)
+        for path in sorted((Path(logger.log_dir) / "videos" / "train").glob("*.mp4")):
+            if path in seen:
+                continue
+            seen.add(path)
+            try:
+                import wandb
+
+                if wandb.run is not None:
+                    wandb.log({"Video/train": wandb.Video(str(path), format="mp4", caption=path.stem)},
+                              step=it)
+            except Exception as e:  # noqa: BLE001 — logging must never end training
+                print(f"[video] could not log {path.name} to W&B: {e}", flush=True)
+
+    logger.log = log
 
 
 from .microduck_velocity_env_cfg import (
