@@ -272,7 +272,7 @@ Never launch a long run without one.
 
 - **Every `train` records video by default** (`train_hook.default_video_on` appends
   `--video True`; opt out with `--video False` or `MICRODUCK_NO_VIDEO=1`). mp4s land in
-  `<run>/videos/train/`, are pushed to W&B as `Video/train` by `MicroduckOnPolicyRunner`, and are
+  `<run>/videos/train/`, are uploaded to W&B (key `video`) by rsl_rl's own logger, and are
   mirrored into the HF checkpoint repo by the Jobs uploader. Watch them.
 - wandb project `mjlab_microduck` under entity `chelleboyer-road-ranger` (the username
   `chelleboyer` is refused as a run entity — pass `WANDB_ENTITY`); logs in `logs/<experiment_name>/`; resume
