@@ -47,11 +47,19 @@ State as of 2026-09-14:
   128/128 episodes, standing AND crouch spawns, 0% AC #4 — while `stable_landing_rate` read 0.98,
   because it only checks the final step. Cause: `_hop_completion_gate` stays open after liftoff,
   so standing back up after a face-plant collected the full landing annuity.
-- **Run 4 change (drafted, not yet run):** `ENABLE_CLEAN_LANDING_GATE` — landing annuities pay 0
-  once any non-foot body touches the ground after the gate opens (`_update_hop_landing_clean`;
-  NOT the old sticky taint — it cannot fire before a flight and leaves take-off terms paid), plus
-  a `clean_landing_rate` metric (AC #4's criterion). **Read `clean_landing_rate`, not
-  `stable_landing_rate`.** Warm-start from rv0u6ot4 `model_999.pt` via `--wandb-run-path`.
+- **Run 4 (W&B `8gnv2koa`, warm start from rv0u6ot4 `model_999`): FAILED, and the lesson is
+  general.** `ENABLE_CLEAN_LANDING_GATE` zeroed the landing annuities once any non-foot body
+  touched the ground after liftoff (`_update_hop_landing_clean`; not the old sticky taint — it
+  cannot fire before a flight). But the policy never landed clean, so EVERY landing it could make
+  scored the same zero: no gradient after liftoff, entropy pushed action std 0.62 → 1.0,
+  `clean_landing_rate` went 0.15 → 0.00 by iter 40 and stayed there; liftoff itself held. An
+  all-or-nothing gate on a skill the policy does not have yet is invisible to PPO.
+  **Read `clean_landing_rate` (AC #4's criterion), not `stable_landing_rate`.**
+- **Run 5 change (smoke-tested, not yet run):** keep the latch but give it a slope —
+  dirty landings keep `DIRTY_LANDING_SCALE_STAGES` of the annuities (0.5 → 0.25 → 0 at iters
+  0/300/600, via `reward_param_curriculum`), plus `hop_landing_contact_cost`, a per-step cost on
+  non-foot ground contact after liftoff (weight −2.0, sized so a dive-and-lie still earns less
+  than not hopping costs: hopping must keep beating not hopping). Fresh start, no warm start.
   `joanfox/microduck-happy-hop` (ONNX, vertical hop) was tested zero-shot in this env and is NOT a
   better warm start: ~10% AC #4, 50% non-foot contact, 20% never lift, backlash model no better.
 

@@ -172,6 +172,22 @@ ENABLE_ENCODER_BIAS                  = True
 # the full landing stack for standing back up afterwards.
 ENABLE_CLEAN_LANDING_GATE = True
 
+# Run 4 (W&B 8gnv2koa) showed the latch alone is too sparse: at scale 0 from
+# step 0 no landing the policy could make ever paid, PPO lost its gradient
+# after liftoff and clean_landing_rate went 0.15 -> 0.00. Run 5 adds a slope:
+#
+#   * a dirty landing keeps a fraction of the annuities, stepped down to 0 —
+#     iteration -> scale. Guessed pacing (liftoff took ~200 iters in run 3);
+#     if clean_landing_rate steps DOWN at a boundary, stretch it (AGENTS.md).
+#   * a per-step cost on non-foot ground contact after liftoff
+#     (mdp.hop_landing_contact_cost), so less contact always pays more.
+#     Sized from run 3's logged reward mass: liftoff pays ~3.3/episode
+#     (hop_air_time 1.6 + hop_forward_progress 1.65); the worst case — dive,
+#     then lie there for ~83% of the episode — costs ~0.83*|w|. |w| must stay
+#     well under 4 so that hopping always beats not hopping; -2.0 leaves ~+1.6.
+DIRTY_LANDING_SCALE_STAGES = ((0, 0.5), (300, 0.25), (600, 0.0))
+LANDING_CONTACT_COST_WEIGHT = -2.0
+
 # ── Ranges (matched to the roulade/standup envs) ─────────────────────────────
 COM_RANDOMIZATION_RANGE             = 0.003   # ramped via curriculum
 HEAD_COM_RANDOMIZATION_RANGE        = 0.003   # ramped via curriculum
@@ -504,6 +520,17 @@ def make_microduck_hop_env_cfg(
         if stance is not None:
             cfg.rewards[name].params["stance"] = stance
         cfg.rewards[name].params["require_clean_landing"] = ENABLE_CLEAN_LANDING_GATE
+        cfg.rewards[name].params["dirty_landing_scale"] = DIRTY_LANDING_SCALE_STAGES[0][1]
+
+    # Dense clean-landing signal (see DIRTY_LANDING_SCALE_STAGES above).
+    # Ordinary cost (returns >= 0) -> NEGATIVE weight. Live from step 0: it is
+    # gated on a completed flight, so like hop_airborne_tilt it cannot tax an
+    # attempt.
+    cfg.rewards["hop_landing_contact"] = RewardTermCfg(
+        func=microduck_mdp.hop_landing_contact_cost,
+        weight=LANDING_CONTACT_COST_WEIGHT if ENABLE_CLEAN_LANDING_GATE else 0.0,
+        params={"min_air_time": HOP_MIN_AIR_TIME},
+    )
 
     cfg.rewards["hop_stand_tax"] = RewardTermCfg(
         func=microduck_mdp.hop_stand_tax,
@@ -939,6 +966,21 @@ def make_microduck_hop_env_cfg(
             ],
         },
     )
+
+    # One schedule for all three landing annuities: how much a dirty landing
+    # still earns (see DIRTY_LANDING_SCALE_STAGES).
+    if ENABLE_CLEAN_LANDING_GATE:
+        cfg.curriculum["dirty_landing_scale"] = CurriculumTermCfg(
+            func=microduck_mdp.reward_param_curriculum,
+            params={
+                "reward_names": ["hop_landing_composite", "hop_upright_after_landing",
+                                 "hop_height_after_landing"],
+                "param_stages": [
+                    {"step": it * 24, "params": {"dirty_landing_scale": scale}}
+                    for it, scale in DIRTY_LANDING_SCALE_STAGES
+                ],
+            },
+        )
 
     return cfg
 

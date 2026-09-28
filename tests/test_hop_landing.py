@@ -217,3 +217,73 @@ def test_the_gate_off_is_bit_identical():
     env.nonfoot.data.found = torch.ones(1, 13)
     assert microduck_mdp._hop_clean_landing(env, False, HOP_MIN_AIR_TIME) == 1.0
     assert not bool(env._hop_landing_dirty[0])      # not even evaluated
+
+
+# ── run 5: a slope toward the clean landing (run 4's latch had none) ─────────
+
+from mjlab_microduck.tasks.microduck_hop_env_cfg import (  # noqa: E402
+    DIRTY_LANDING_SCALE_STAGES,
+    LANDING_CONTACT_COST_WEIGHT,
+)
+
+
+def test_dirty_landings_keep_partial_pay_that_steps_down_to_zero():
+    cfg = make_microduck_hop_env_cfg()
+    for name in GATED:
+        assert cfg.rewards[name].params["dirty_landing_scale"] == DIRTY_LANDING_SCALE_STAGES[0][1]
+    stages = cfg.curriculum["dirty_landing_scale"].params["param_stages"]
+    assert set(cfg.curriculum["dirty_landing_scale"].params["reward_names"]) == set(GATED)
+    scales = [s["params"]["dirty_landing_scale"] for s in stages]
+    steps = [s["step"] for s in stages]
+    # Run 4: scale 0 from step 0 left no gradient after liftoff.
+    assert scales[0] > 0.0
+    assert scales == sorted(scales, reverse=True) and scales[-1] == 0.0
+    assert steps == sorted(steps) and steps[0] == 0
+    assert all(s % 24 == 0 for s in steps)            # env steps = iterations x 24
+
+
+def test_landing_contact_cost_is_sized_so_hopping_still_beats_not_hopping():
+    cfg = make_microduck_hop_env_cfg()
+    assert cfg.rewards["hop_landing_contact"].weight == LANDING_CONTACT_COST_WEIGHT < 0
+    # Run 3's logged liftoff pay was ~3.3/episode (air 1.6 + forward 1.65); the
+    # worst case costs ~0.83*|w| (lying down for the rest of the episode).
+    assert 0.83 * abs(LANDING_CONTACT_COST_WEIGHT) < 3.3 / 1.5
+
+
+def test_a_dirty_landing_keeps_the_scheduled_fraction():
+    env = _Env()
+    env.open_gate()
+    env.common_step_counter += 1
+    env.nonfoot.data.found = torch.ones(1, 13)
+    assert float(microduck_mdp._hop_clean_landing(env, True, HOP_MIN_AIR_TIME, 0.5)[0]) == 0.5
+    env.common_step_counter += 1
+    env.nonfoot.data.found = torch.zeros(1, 13)
+    assert float(microduck_mdp._hop_clean_landing(env, True, HOP_MIN_AIR_TIME, 0.25)[0]) == 0.25
+
+
+def _contact_cost(env: _Env, touching: bool) -> float:
+    env.common_step_counter += 1
+    env.nonfoot.data.found = torch.full((1, 13), float(touching))
+    return float(microduck_mdp.hop_landing_contact_cost(env, HOP_MIN_AIR_TIME)[0])
+
+
+def test_contact_cost_is_dense_after_liftoff_and_silent_before(monkeypatch):
+    monkeypatch.setattr(microduck_mdp, "_update_hop_accum", lambda env: None)
+    env = _Env()
+    assert _contact_cost(env, True) == 0.0            # a pre-hop fall is not charged
+    env.open_gate()
+    assert _contact_cost(env, False) == 0.0           # flight / feet-only landing: free
+    assert [_contact_cost(env, True) for _ in range(3)] == [1.0, 1.0, 1.0]   # every step
+    assert _contact_cost(env, False) == 0.0           # back on its feet: stops charging
+
+
+def test_reward_param_curriculum_moves_every_named_term_together():
+    terms = {n: SimpleNamespace(params={"dirty_landing_scale": 0.5}) for n in GATED}
+    env = SimpleNamespace(common_step_counter=0,
+                          reward_manager=SimpleNamespace(get_term_cfg=terms.__getitem__))
+    stages = [{"step": it * 24, "params": {"dirty_landing_scale": s}} for it, s in DIRTY_LANDING_SCALE_STAGES]
+    for it, scale in DIRTY_LANDING_SCALE_STAGES:
+        env.common_step_counter = it * 24
+        v = microduck_mdp.reward_param_curriculum(env, None, list(GATED), stages)
+        assert float(v) == scale
+        assert all(t.params["dirty_landing_scale"] == scale for t in terms.values())

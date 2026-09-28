@@ -758,6 +758,7 @@ def test_hop_new_reward_signs_follow_the_convention():
     # ordinary costs (return >= 0) -> NEGATIVE weight
     assert r["hop_airborne_tilt"].weight < 0
     assert r["hop_lateral_drift"].weight < 0
+    assert r["hop_landing_contact"].weight < 0
     # ordinary reward -> POSITIVE weight
     assert r["hop_launch_velocity"].weight > 0
     assert r["hop_launch_velocity"].params["target_velocity"] == TARGET_LAUNCH_VZ

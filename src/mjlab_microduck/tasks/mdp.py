@@ -3603,6 +3603,32 @@ def reward_weight(
     return torch.tensor([term_cfg.weight])
 
 
+def reward_param_curriculum(
+    env: ManagerBasedRlEnv,
+    env_ids: torch.Tensor,
+    reward_names: list,
+    param_stages: list[dict],
+) -> torch.Tensor:
+    """Step-staged reward PARAMS: event_param_curriculum's twin for rewards.
+
+    ``param_stages`` is a list of ``{"step": int, "params": dict}``; the latest
+    stage whose step has been reached is shallow-merged into the live params of
+    EVERY term in ``reward_names`` (one schedule for terms that must move
+    together, e.g. the three hop landing annuities). Mutates the live
+    RewardManager term cfgs, not env.cfg (a deepcopy at manager init).
+    Returns the first param's value of the active stage, for logging.
+    """
+    del env_ids
+    current = param_stages[0]["params"]
+    for stage in param_stages:
+        if env.common_step_counter >= stage["step"]:
+            current = stage["params"]
+    for name in reward_names:
+        env.reward_manager.get_term_cfg(name).params.update(current)
+    first_val = next(iter(current.values()))
+    return torch.tensor(float(first_val) if isinstance(first_val, (int, float)) else 0.0)
+
+
 def com_range_curriculum(
     env: ManagerBasedRlEnv,
     env_ids: torch.Tensor,
@@ -8092,16 +8118,60 @@ def _update_hop_landing_clean(
     env._hop_landing_dirty = env._hop_landing_dirty | (gate_open & touching)
 
 
-def _hop_clean_landing(env: ManagerBasedRlEnv, require: bool, min_air_time: float):
-    """Multiplier for the landing terms: 0 once the landing latched dirty.
+def _hop_clean_landing(
+    env: ManagerBasedRlEnv, require: bool, min_air_time: float, dirty_scale: float = 0.0
+):
+    """Multiplier for the landing terms: ``dirty_scale`` once the landing latched dirty.
 
     1.0 (a plain float, as _hop_stance returns) when not required, so the
     terms are bit-identical to before for any cfg that leaves it off.
+
+    ``dirty_scale`` exists because 0.0 from step 0 failed (run 4, W&B
+    8gnv2koa, 2026-09-28): the policy never produced a clean landing, so
+    every landing it could make scored the same zero, PPO had no gradient
+    after liftoff, entropy pushed action std 0.62 -> 1.0 and
+    clean_landing_rate went 0.15 -> 0.00 in 40 iterations and stayed there.
+    Keep partial pay for a dirty landing (so "land, then stand" still beats
+    "land, then lie there") and step it toward 0 by curriculum.
     """
     if not require:
         return 1.0
     _update_hop_landing_clean(env, min_air_time)
-    return (~env._hop_landing_dirty).float()
+    return torch.where(
+        env._hop_landing_dirty,
+        torch.full_like(env._hop_clean_time, float(dirty_scale)),
+        torch.ones_like(env._hop_clean_time),
+    )
+
+
+def hop_landing_contact_cost(
+    env: ManagerBasedRlEnv,
+    min_air_time: float = 0.06,
+    sensor_name: str = "nonfoot_ground_contact",
+) -> torch.Tensor:
+    """Cost: 1.0 on every step a non-foot body touches the ground after liftoff.
+
+    The DENSE half of the clean-landing signal. The latch alone is binary per
+    episode, so a policy that never lands clean sees no difference between
+    brushing the jaw for one step and lying on its chest for two seconds —
+    run 4's failure. Charging per step of contact ranks those: less contact
+    is always better, which is a slope from the dive toward a clean landing.
+
+    Gated on the completion gate, like the latch: a pre-hop fall costs
+    nothing here (the clean-time clock handles those), so this cannot tax an
+    attempt or make "do nothing" the argmax. Size the weight so that the
+    worst case (dive, then lie there for the rest of the episode) still
+    costs less than a liftoff earns — hopping must beat not hopping.
+
+    Ordinary cost (returns >= 0) -> NEGATIVE weight.
+    """
+    _update_hop_accum(env)
+    if sensor_name not in env.scene.sensors:
+        return torch.zeros(env.num_envs, device=env.device)
+    found = env.scene.sensors[sensor_name].data.found
+    touching = torch.nan_to_num(found, nan=0.0).reshape(found.shape[0], -1).any(dim=-1)
+    gate_open = _hop_completion_gate(env, min_air_time) > 0.0
+    return (gate_open & touching).float()
 
 
 def hop_landing_composite(
@@ -8115,6 +8185,7 @@ def hop_landing_composite(
     target_overrides: Optional[dict] = None,
     stance: Optional[str] = None,
     require_clean_landing: bool = False,
+    dirty_landing_scale: float = 0.0,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
     """standing_composite_score × completion gate — the landing/recovery annuity.
@@ -8124,8 +8195,9 @@ def hop_landing_composite(
     threshold. ``stance`` ("left" / "right", the one-foot hopscotch landings)
     additionally multiplies by hop_landing_stance_factor; None (the two-foot
     Mjlab-Hop task) leaves this term exactly as it was.
-    ``require_clean_landing`` additionally zeroes it once any non-foot body
-    has touched the ground since liftoff (_update_hop_landing_clean).
+    ``require_clean_landing`` additionally scales it by ``dirty_landing_scale``
+    once any non-foot body has touched the ground since liftoff
+    (_update_hop_landing_clean / _hop_clean_landing).
     """
     asset: Entity = env.scene[asset_cfg.name]
     _update_hop_accum(env)
@@ -8140,7 +8212,7 @@ def hop_landing_composite(
         asset_cfg=asset_cfg,
     )
     return (score * _hop_completion_gate(env, min_air_time) * _hop_stance(env, stance, min_air_time)
-            * _hop_clean_landing(env, require_clean_landing, min_air_time))
+            * _hop_clean_landing(env, require_clean_landing, min_air_time, dirty_landing_scale))
 
 
 def hop_upright_after_landing(
@@ -8148,6 +8220,7 @@ def hop_upright_after_landing(
     min_air_time: float = 0.06,
     stance: Optional[str] = None,
     require_clean_landing: bool = False,
+    dirty_landing_scale: float = 0.0,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
     """Linear cos(tilt) × completion gate — bootstrap pull toward vertical."""
@@ -8157,7 +8230,7 @@ def hop_upright_after_landing(
     upright = 1.0 - 2.0 * (quat[:, 1].pow(2) + quat[:, 2].pow(2))
     return (torch.clamp(upright, min=0.0) * _hop_completion_gate(env, min_air_time)
             * _hop_stance(env, stance, min_air_time)
-            * _hop_clean_landing(env, require_clean_landing, min_air_time))
+            * _hop_clean_landing(env, require_clean_landing, min_air_time, dirty_landing_scale))
 
 
 def hop_height_after_landing(
@@ -8167,6 +8240,7 @@ def hop_height_after_landing(
     min_air_time: float = 0.06,
     stance: Optional[str] = None,
     require_clean_landing: bool = False,
+    dirty_landing_scale: float = 0.0,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
     """Broad height Gaussian × completion gate — pull up to standing height."""
@@ -8177,7 +8251,7 @@ def hop_height_after_landing(
     )
     g = torch.exp(-((z - target_height) / std) ** 2)
     return (g * _hop_completion_gate(env, min_air_time) * _hop_stance(env, stance, min_air_time)
-            * _hop_clean_landing(env, require_clean_landing, min_air_time))
+            * _hop_clean_landing(env, require_clean_landing, min_air_time, dirty_landing_scale))
 
 
 def hop_stand_tax(
