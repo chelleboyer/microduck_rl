@@ -64,7 +64,18 @@ State as of 2026-09-14:
   `clean_landing_rate` stayed 0.00. Per-body eval of model_500: `trunk_base` down ~0.2 s after
   liftoff, then `jaw_soft` propping the robot ~0.3 s, 32/32 episodes. The policy shortened the
   dive; it never changed HOW it lands.
-- **Run 6 change (smoke-tested, not yet run): vertical first, forward second** (the plan's AC #3).
+- **Run 6 (W&B `2qbd5bto`, fresh, 1500 iters): FIRST CLEAN LANDINGS.** Liftoff in ~125 iters
+  with forward at 0; `clean_landing_rate` 0 → 0.38 by iter 229, when the gate opened. Every
+  forward stage then cost clean landings (0.48 @1.5 → 0.29 @3.0 → 0.14 just after 5.0 at
+  iter 430). That step-down is a pacing signal for the next cfg — hold a stage until clean
+  landings are stable, not just above 30%. It recovered under the full weight: final
+  `clean_landing_rate` 0.50, `stable_landing_rate` 0.93, air 0.15 s, launch 0.58 m/s.
+  **It is a continuous bunny hop, not one hop:** ~10 qualifying flights per 3 s episode
+  (model_250). `scripts/eval_hop.py` assumes a single hop — its landing+0.5 s snapshot re-arms
+  on every landing and ~90% of episodes record none — so its AC #4 rate is an artifact on this
+  policy; `clean_landing_rate` is pessimistic too, since one brushed landing out of ~10 fails
+  the episode. Single hop vs perpetual bunny hop is a product decision still open.
+- **Run 6 design: vertical first, forward second** (the plan's AC #3).
   `hop_forward_progress` was paying for the forward lean from step 0. `ENABLE_FORWARD_GATE`:
   forward weight AND the mid-air spawn's forward speed start at 0 and advance one stage
   (`FORWARD_WEIGHT_STAGES` 0 → 1.5 → 3 → 5) only when an EMA of clean landings reaches
