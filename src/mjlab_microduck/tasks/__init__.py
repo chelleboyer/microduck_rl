@@ -85,6 +85,7 @@ from .microduck_hop_env_cfg import (
     MicroduckHopLeftRlCfg,
     MicroduckHopRightRlCfg,
     MicroduckHopOnceRlCfg,
+    MicroduckHopOnceJumpWarmRlCfg,
     MicroduckBunnyHopRlCfg,
 )
 from .backlash import make_backlash_variant
@@ -262,6 +263,17 @@ register_mjlab_task(
     env_cfg=make_microduck_hop_env_cfg(once=True),
     play_env_cfg=make_microduck_hop_env_cfg(play=True, once=True),
     rl_cfg=MicroduckHopOnceRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
+# HopOnce-JumpWarm — HopOnce v3 warm-started from the community jump
+# (ThomasBurgess2000/microduck-max-height-jump); forward gate live, standing-heavy
+# spawns (make_microduck_hop_env_cfg(once=True, jump_warm=True)).
+register_mjlab_task(
+    task_id="Mjlab-HopOnce-JumpWarm-Flat-MicroDuck",
+    env_cfg=make_microduck_hop_env_cfg(once=True, jump_warm=True),
+    play_env_cfg=make_microduck_hop_env_cfg(play=True, once=True, jump_warm=True),
+    rl_cfg=MicroduckHopOnceJumpWarmRlCfg,
     runner_cls=MicroduckOnPolicyRunner,
 )
 

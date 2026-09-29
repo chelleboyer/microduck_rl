@@ -238,6 +238,20 @@ ONCE_ENTROPY_COEF = 0.0025
 ONCE_DESIRED_KL = 0.005
 ONCE_SAVE_INTERVAL = 50
 
+# ── HopOnce-JumpWarm: HopOnce v3 warm-started from the community jump ──────────
+# ThomasBurgess2000/microduck-max-height-jump model_34995 (Apache-2.0), converted by
+# scripts/convert_jump_checkpoint.py. Same 61/74-D obs terms and the same compiled
+# robot (its d424a0c "allcollisions" model is today's groundcontact model); see
+# docs/notes/jump-warmstart-step1.md. Launch with MICRODUCK_WARM_START=1 so every
+# curriculum starts at stage 0: the jump was not trained under ours, so nothing is
+# collapsed. In particular the forward gate stays live (forward weight and mid-air
+# vx start at 0 and advance on clean landings), and so does the dirty-landing slope.
+# The jump launches under HopOnce's near-zero command (89% of standing episodes
+# with its flag held at 0), so the task keeps the publishable constant-command
+# contract. Crouch and mid-air spawns are out of distribution for it (it never
+# triggered from our crouch in 123/128), so the spawn mix starts standing-heavy.
+JUMPWARM_SPAWN_MIX = {"standing_prob": 0.70, "crouch_prob": 0.15, "midair_prob": 0.15}
+
 # ── BunnyHop: perpetual forward bunny hop (make_microduck_hop_env_cfg(perpetual=True)) ─
 # Run 6's continuous hop, published as chelleboyer/microduck-bunny-hop, FALLS:
 # in the training-latency-matched rehearsal 55 of 59 distinct 10 s rollouts
@@ -444,6 +458,7 @@ def make_microduck_hop_env_cfg(
     landing: str = "both",
     once: bool = False,
     perpetual: bool = False,
+    jump_warm: bool = False,
 ) -> ManagerBasedRlEnvCfg:
     """Create Microduck hop environment configuration.
 
@@ -452,8 +467,10 @@ def make_microduck_hop_env_cfg(
     ``once`` builds Mjlab-HopOnce: the same hop, then stand — flying again
     after the first landing costs (see ONCE_* constants).
     ``perpetual`` builds Mjlab-BunnyHop: keep hopping, never fall (BUNNY_*).
+    ``jump_warm`` (with ``once``) builds Mjlab-HopOnce-JumpWarm (JUMPWARM_*).
     """
     assert not (once and perpetual), "HopOnce and BunnyHop are different tasks"
+    assert not jump_warm or once, "JumpWarm is a HopOnce variant"
     assert landing in HOP_LANDINGS, landing
     stance = None if landing == "both" else landing
 
@@ -1115,8 +1132,10 @@ def make_microduck_hop_env_cfg(
             params={"min_air_time": HOP_MIN_AIR_TIME},
             reduce="last",
         )
-    if once or perpetual:
+    if (once and not jump_warm) or perpetual:
         _collapse_run6_curricula(cfg)
+    if jump_warm:
+        cfg.curriculum["hop_spawn_mix"].params["param_stages"][0]["params"] = dict(JUMPWARM_SPAWN_MIX)
 
     if perpetual:
         cfg.episode_length_s = BUNNY_EPISODE_LENGTH_S
@@ -1138,11 +1157,11 @@ def make_microduck_hop_env_cfg(
 # ── RL runner config ──────────────────────────────────────────────────────────
 
 def _hop_rl_cfg(landing: str = "both", once: bool = False,
-                perpetual: bool = False) -> RslRlOnPolicyRunnerCfg:
+                perpetual: bool = False, jump_warm: bool = False) -> RslRlOnPolicyRunnerCfg:
     # Mirror loss only for the sagittal two-foot hop: the one-foot landings
     # name a side (AGENTS.md: never for an asymmetric task).
     suffix = (("" if landing == "both" else f"_{landing}") + ("_once" if once else "")
-              + ("_bunny" if perpetual else ""))
+              + ("_bunny" if perpetual else "") + ("_jumpwarm" if jump_warm else ""))
     return RslRlOnPolicyRunnerCfg(
         actor=RslRlModelCfg(
             hidden_dims=(512, 256, 128),
@@ -1188,3 +1207,4 @@ MicroduckHopLeftRlCfg = _hop_rl_cfg("left")
 MicroduckHopRightRlCfg = _hop_rl_cfg("right")
 MicroduckHopOnceRlCfg = _hop_rl_cfg("both", once=True)
 MicroduckBunnyHopRlCfg = _hop_rl_cfg("both", perpetual=True)
+MicroduckHopOnceJumpWarmRlCfg = _hop_rl_cfg("both", once=True, jump_warm=True)
