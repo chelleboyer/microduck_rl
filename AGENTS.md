@@ -96,6 +96,12 @@ State as of 2026-09-14:
     policy**: 57/64 episodes make exactly one flight, 100% end standing, and the median tilt at
     landing + 0.5 s is 2.8°. AC #4 is 44% (standing) and 41% (crouch). The main miss is a foot
     off the ground at landing + 0.5 s (50/128), then non-foot contact (19/128).
+    **v3** (W&B `ooiuyfac`, 3250 → 3549): `hop_planted_after_landing` (+1.0), entropy 0.0025,
+    desired_kl 0.005, and a save every 50 iterations. No relapse this time: action std went
+    0.33 → 0.17 and `extra_flight_rate` settled at about 0.35. `model_3549`: 57/64 episodes make
+    one flight, and AC #4 is 71/128 (55%, against 52/128 for 3250 in the same breakdown).
+    Lifted-foot misses fell from 55 to 43. Non-foot contacts rose from 19 to 25, and the hop
+    shrank (CoM rise 25.6 → 16.6 mm, launch 0.39 → 0.35 m/s).
 - **Run 6 design: vertical first, forward second** (the plan's AC #3).
   `hop_forward_progress` was paying for the forward lean from step 0. `ENABLE_FORWARD_GATE`:
   forward weight AND the mid-air spawn's forward speed start at 0 and advance one stage
