@@ -138,6 +138,10 @@ def run(task_id: str, cfg: Cfg) -> list[EpisodeSummary]:
 
     n = cfg.episodes
     env_cfg = load_env_cfg(task_id, play=True)
+    # The hop_spawn_mix curriculum rewrites set_hop_state's spawn mix on every
+    # reset (curricula run before reset events), which would override cfg.spawn
+    # (same fix as eval_hop.drop_spawn_mix_curriculum).
+    env_cfg.curriculum.pop("hop_spawn_mix", None)
     agent_cfg = load_rl_cfg(task_id)
     env_cfg.scene.num_envs = n
     env_cfg.auto_reset = False

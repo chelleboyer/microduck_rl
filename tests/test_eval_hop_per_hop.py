@@ -66,3 +66,12 @@ def test_summary_rates():
     assert s["first_hop_clean_frac"] == 0.0 and s["all_hops_clean_episode_frac"] == 0.0
     assert s["ended_upright_frac"] == 0.5
     assert s["hops_per_s"] == pytest.approx(2 / (32 * DT))
+
+
+def test_per_hop_eval_drops_the_spawn_mix_curriculum():
+    """Otherwise the hop_spawn_mix curriculum overrides Cfg.spawn on every reset."""
+    import inspect
+
+    import eval_hop_per_hop as ph
+
+    assert 'env_cfg.curriculum.pop("hop_spawn_mix", None)' in inspect.getsource(ph.run)
