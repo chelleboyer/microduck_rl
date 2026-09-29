@@ -48,7 +48,12 @@ BOOTSTRAP = r"""
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get install -qq -y --no-install-recommends git curl ca-certificates xz-utils >/dev/null
+# libegl1: the pytorch/pytorch runtime image ships no OpenGL/EGL client
+# library at all, so mujoco's EGL backend (needed by --video's offscreen
+# renderer; see MUJOCO_GL below) fails at IMPORT time with
+# "'NoneType' object has no attribute 'eglQueryString'" — PyOpenGL can't even
+# dlopen libEGL.so.1, let alone reach a GPU vendor ICD. Hit 2026-09-12.
+apt-get install -qq -y --no-install-recommends git curl ca-certificates xz-utils libegl1 libgl1 >/dev/null
 # Pinned uv: the cache bucket persists across jobs, and a floating "latest" uv
 # reading entries written by an older uv corrupts installs (seen 2026-07-21:
 # bam's built-wheel cache entry from a 0.9.x-era job made 0.11.30 fail with
@@ -96,11 +101,22 @@ CKPT_ONE_SHOT=1 uv run python scripts/hf/uploader.py || true
 if [ "$TRAIN_RC" -eq 0 ] && [ "${AUTO_EXPORT:-1}" = "1" ]; then
     set +e
     TASK_ID=${TRAIN_ARGS%% *}
-    CKPT=$(ls -t logs/rsl_rl/*/model_*.pt 2>/dev/null | head -1)
+    # Checkpoints land at logs/rsl_rl/<experiment_name>/<run>/model_*.pt —
+    # THREE levels, because every env cfg sets its own experiment_name
+    # (microduck_hop, velocity, ground_pick, ...). This globbed two levels
+    # until 2026-09-13 and so matched nothing for any task in the repo: the
+    # job printed "no checkpoint found", skipped the export and still exited
+    # 0, so a green run never meant an ONNX existed. The second pattern is a
+    # fallback for a flat layout; ls -t orders both by mtime and a
+    # non-matching glob is silenced by the redirect.
+    CKPT=$(ls -t logs/rsl_rl/*/*/model_*.pt logs/rsl_rl/*/model_*.pt 2>/dev/null | head -1)
     if [ -n "$CKPT" ]; then
-        echo "[bootstrap] auto-exporting ONNX from $(basename "$CKPT")"
+        echo "[bootstrap] auto-exporting ONNX from $CKPT"
+        # Full path, NOT basename: export.py does `Path(checkpoint_file)`
+        # verbatim (src/mjlab_microduck/export.py) and derives log_dir from
+        # its parent, so a bare filename resolves to ./model_N.pt and fails.
         uv run python scripts/export.py "$TASK_ID" \
-            --checkpoint-file "$(basename "$CKPT")" \
+            --checkpoint-file "$CKPT" \
             --num-envs 1 --onnx-file /work/policy.onnx \
         && uv run python - <<'PY'
 import os
@@ -324,6 +340,22 @@ def submit(argv: list[str]) -> int:
         "MICRODUCK_IN_HF_JOB": "1",
         "CKPT_REPO": ckpt_repo,
         "TRAIN_ARGS": " ".join(shlex.quote(a) for a in [args.task, *train_args]),
+        # HF Jobs GPU containers have no display. mjlab's train.py already sets
+        # MUJOCO_EGL_DEVICE_ID (targets the right GPU for EGL) but never
+        # selects EGL as the backend, so --video's offscreen renderer falls
+        # back to GLX/X11 and mujoco.Renderer() hard-crashes with
+        # "an OpenGL platform library has not been loaded" — hit 2026-09-12,
+        # first time anything on this repo ran --video via --hf-jobs. Setting
+        # this here (container env, before the job's Python even starts) is
+        # the fix; it's a no-op for non-video runs, so left unconditional.
+        # NOTE: NVIDIA_DRIVER_CAPABILITIES is NOT settable here — HF Jobs
+        # rejects it as a reserved env var (confirmed 2026-09-12, "Bad
+        # Request: Reserved environment variable ... cannot be set"). If the
+        # GPU's EGL vendor ICD still isn't mounted once libegl1 is present
+        # (BOOTSTRAP, below), that capability is on the platform to fix, not
+        # us — the crash signature differs (an EGL runtime error, not
+        # PyOpenGL's import-time "'NoneType' object has no attribute").
+        "MUJOCO_GL": "egl",
     }
     # Warm start (tasks/mdp.py Patch 5): curricula restart at 0 after the
     # checkpoint load. Forwarded so `MICRODUCK_WARM_START=1 uv run train ... --hf-jobs`

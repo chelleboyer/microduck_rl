@@ -75,6 +75,10 @@ from .microduck_roulade_env_cfg import (
     make_microduck_roulade_env_cfg,
     MicroduckRouladeRlCfg,
 )
+from .microduck_hop_env_cfg import (
+    make_microduck_hop_env_cfg,
+    MicroduckHopRlCfg,
+)
 from .backlash import make_backlash_variant
 
 # Standard velocity task
@@ -230,6 +234,16 @@ register_mjlab_task(
     env_cfg=make_microduck_roulade_env_cfg(),
     play_env_cfg=make_microduck_roulade_env_cfg(play=True),
     rl_cfg=MicroduckRouladeRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
+# Hop — both feet leave the ground at once, land upright, recover to standing.
+# Attempt 1, run 1 — see microduck_hop_env_cfg.py header for what is unverified.
+register_mjlab_task(
+    task_id="Mjlab-Hop-Flat-MicroDuck",
+    env_cfg=make_microduck_hop_env_cfg(),
+    play_env_cfg=make_microduck_hop_env_cfg(play=True),
+    rl_cfg=MicroduckHopRlCfg,
     runner_cls=MicroduckOnPolicyRunner,
 )
 

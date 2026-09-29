@@ -151,6 +151,38 @@ def test_submitted_job_env_disarms_the_interception():
     )
 
 
+def test_submitted_job_env_selects_egl_for_headless_rendering():
+    """HF Jobs GPU containers have no display: --video's offscreen renderer
+    (mujoco.Renderer) hard-crashes with "an OpenGL platform library has not
+    been loaded" unless MUJOCO_GL=egl is set before mujoco picks a backend
+    (2026-09-12, first --video run on HF Jobs). Source-level like the
+    interception check above — a stripped or renamed key regresses silently
+    otherwise, same reasoning as MICRODUCK_IN_HF_JOB."""
+    src = (_ROOT / "src/mjlab_microduck/hf_jobs.py").read_text()
+    assert '"MUJOCO_GL": "egl"' in src, (
+        "submit() must put MUJOCO_GL=egl on the job's env, or any --video run "
+        "on HF Jobs crashes before the first iteration"
+    )
+
+
+def test_bootstrap_installs_libegl():
+    """MUJOCO_GL=egl alone isn't enough on this image (2026-09-12): the
+    pytorch/pytorch runtime image ships no libEGL.so.1 at all, so PyOpenGL
+    fails at import time ("'NoneType' object has no attribute
+    'eglQueryString'") before mujoco.Renderer is ever reached.
+
+    NVIDIA_DRIVER_CAPABILITIES is NOT the fix for this and must NOT be added
+    to submit()'s env — HF Jobs rejects it as a reserved variable (confirmed
+    2026-09-12: "Bad Request: Reserved environment variable ... cannot be
+    set"), so don't reintroduce it without checking that's changed."""
+    src = (_ROOT / "src/mjlab_microduck/hf_jobs.py").read_text()
+    assert "libegl1" in src, "BOOTSTRAP must apt-install libegl1 for --video on HF Jobs"
+    assert '"NVIDIA_DRIVER_CAPABILITIES":' not in src, (
+        "HF Jobs rejects this as a reserved env var — submission fails outright if set "
+        "(a comment mentioning the name is fine; setting it as a dict key is not)"
+    )
+
+
 # The load-bearing assumption, exercised through the real import paths: both
 # `from mjlab.scripts.train import main` (mjlab's shim) and our own shim must
 # reach the hook before mjlab parses argv. In a subprocess, because it ends in
@@ -203,3 +235,63 @@ def test_both_train_shims_reach_the_hook_before_parsing_argv(shim):
     assert proc.returncode == 0, f"probe failed:\n{proc.stderr[-2000:]}"
     assert f"SUBMIT ['{_TASK}', '--env.scene.num-envs', '4096']" in proc.stdout
     assert "EXIT 7" in proc.stdout
+
+
+# ── HF Jobs bootstrap: the post-training ONNX auto-export ────────────────────
+
+
+def _bootstrap_ckpt_glob() -> str:
+    """The `ls -t ...` checkpoint-discovery line from the bootstrap script."""
+    import re
+
+    from mjlab_microduck.hf_jobs import BOOTSTRAP
+
+    m = re.search(r"^\s*CKPT=\$\((ls -t .*?)\s*2>/dev/null", BOOTSTRAP, re.M)
+    assert m, "could not find the CKPT discovery line in BOOTSTRAP"
+    return m.group(1)
+
+
+def test_auto_export_glob_finds_a_real_checkpoint_layout(tmp_path):
+    """THE regression for a silent no-op (found 2026-09-13).
+
+    The glob was `logs/rsl_rl/*/model_*.pt`, but checkpoints land at
+    logs/rsl_rl/<experiment_name>/<run>/model_*.pt — three levels, since
+    every env cfg sets its own experiment_name. It matched nothing for
+    EVERY task in the repo, so the job printed "no checkpoint found",
+    skipped the export and still exited 0: a green `--hf-jobs` run never
+    meant an ONNX had been produced.
+
+    Exercised as a real shell glob against a real directory tree rather
+    than asserted as text, so it tests the behaviour and not the spelling.
+    """
+    import subprocess
+
+    import os
+
+    run = tmp_path / "logs" / "rsl_rl" / "microduck_hop" / "2026-09-13_21-20-20_microduck_hop"
+    run.mkdir(parents=True)
+    (run / "model_0.pt").write_text("x")
+    (run / "model_4.pt").write_text("x")
+    # Set mtimes explicitly: written back-to-back the two can land in the
+    # same filesystem timestamp tick, and `ls -t` then breaks the tie by
+    # name — which would make the "newest" assertion below flaky.
+    os.utime(run / "model_0.pt", (1_000_000, 1_000_000))
+    os.utime(run / "model_4.pt", (2_000_000, 2_000_000))
+
+    out = subprocess.run(
+        f"{_bootstrap_ckpt_glob()} 2>/dev/null | head -1",
+        shell=True, cwd=tmp_path, capture_output=True, text=True,
+    ).stdout.strip()
+
+    assert out, "the auto-export glob found no checkpoint in a real layout"
+    assert out.endswith("model_4.pt"), f"expected the newest checkpoint, got {out}"
+
+
+def test_auto_export_passes_the_full_checkpoint_path():
+    """export.py does `Path(checkpoint_file)` verbatim and takes log_dir from
+    its parent, so passing `basename` resolves to ./model_N.pt and fails.
+    The bootstrap used to do exactly that, behind the broken glob."""
+    from mjlab_microduck.hf_jobs import BOOTSTRAP
+
+    assert '--checkpoint-file "$CKPT"' in BOOTSTRAP
+    assert '--checkpoint-file "$(basename "$CKPT")"' not in BOOTSTRAP
