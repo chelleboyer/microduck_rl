@@ -95,3 +95,42 @@ median of step 18 (0.36 s), during or after the hop. The crouch bucket was 15% o
 - **Candidate:** `model_999` for balance (84% standing AC #4, and it recovers from crouch), or
   `model_500` if standing is all that matters. The checkpoints between them (550–950) are
   unevaluated and may do better on both.
+
+## Checkpoint sweep and publish (2026-09-29)
+
+**Selection rule, fixed before the results were read:** the highest standing AC #4 among
+checkpoints that end upright in ≥ 90% of crouch starts, confirmed by the per-hop battery. The
+first pass used the AC #4 battery's "standing" end-state cluster for the crouch criterion. That
+cluster files every no-flight episode under "never-lifted" whether or not the robot is upright,
+so the per-hop battery's upright-at-3 s figure was used instead.
+
+| ckpt | standing AC #4 | crouch end states (AC #4 battery) | crouch upright at 3 s |
+|---:|---:|---|---:|
+| 500 | 116 | side 92, never-lifted 31, prone 5 | 0% |
+| 550 | 119 | side 88, never-lifted 35, prone 5 | — |
+| 600 | 108 | side 82, never-lifted 39, standing 3 | — |
+| 650 | 117 | side 83, never-lifted 28, standing 15 | — |
+| 700 | 115 | side 54, standing 41, never-lifted 32 | — |
+| 750 | 114 | standing 79, never-lifted 28, side 19 | — |
+| 800 | 116 | standing 101, never-lifted 21, side 4 | — |
+| **850** | **121** | standing 99, never-lifted 22, side 4 | **97.7%** |
+| 900 | 118 | standing 98, never-lifted 20, side 6 | 99.2% |
+| 950 | 114 | standing 115, never-lifted 9 | 97.7% |
+| 999 | 108 | standing 117, never-lifted 7 | 99.2% |
+
+Counts are out of 128. "—" means not measured; each of those checkpoints scores below 850 on
+standing AC #4, so it could not win under the rule.
+
+- **Crouch recovery is learned between iterations 650 and 800;** standing AC #4 holds at
+  89–95% from iteration 550 on.
+- **`model_850`, standing, per-hop battery:** exactly one flight in 126/128, first landing
+  clean in 97%, 0.16 s air, 6.7 cm forward, 100% upright.
+- **`model_850`, crouch, per-hop battery:** 0.12 s air, first landing clean in only 29%
+  (crouch landings remain the open defect).
+
+**Published:** `chelleboyer/microduck-hop-once` (private), tag `v1`, commit `dff8a4e`. The
+ONNX was exported from the exact evaluated checkpoint file and reproduces it within 9.5e-7 on
+live observations. The manifest is episodic, `duration_s` 3.0 (the training episode length),
+a constant zero command and a standing entry pose. It says `training.commit` `8eda471`, the
+HEAD at publish time; the training code is `6f92a56`, and later commits touch only docs.
+Hardware-unverified.
