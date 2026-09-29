@@ -100,7 +100,7 @@ State as of 2026-09-14:
     desired_kl 0.005, and a save every 50 iterations. No relapse this time: action std went
     0.33 → 0.17 and `extra_flight_rate` settled at about 0.35. `model_3549`: 57/64 episodes make
     one flight, and AC #4 is 71/128 (55%, against 52/128 for 3250 in the same breakdown).
-    Lifted-foot misses fell from 55 to 43. Non-foot contacts rose from 19 to 25, and the hop
+    Lifted-foot misses fell from 57 to 43. Non-foot contacts rose from 19 to 25, and the hop
     shrank (CoM rise 25.6 → 16.6 mm, launch 0.39 → 0.35 m/s).
 - **Run 6 design: vertical first, forward second** (the plan's AC #3).
   `hop_forward_progress` was paying for the forward lean from step 0. `ENABLE_FORWARD_GATE`:
