@@ -222,6 +222,21 @@ FORWARD_GATE_MIN_DWELL_ITERS = 100
 ONCE_EXTRA_FLIGHT_WEIGHT = -4.0
 ONCE_FIRST_FLIGHT_ONLY_TERMS = ("hop_unweighting", "hop_launch_velocity", "hop_air_time",
                                 "hop_forward_progress")
+# v3 (continues v2 W&B lxqqe9j1 from model_3250). v2's one-hop policy peaked at
+# iter ~3200 (extra_flight_rate 0.47, clean landings 0.84), then with no
+# curriculum change slid back to re-hopping while action std rose 0.32 -> 0.45;
+# the final model_3497 makes a median of 3 flights. model_3250 ends standing
+# 100% of the time but misses AC #4 mostly on a lifted foot at landing + 0.5 s.
+#   - hop_planted_after_landing pays both feet down (and nothing else) after the
+#     first landing. +1.0 is a quarter of the landing composite's peak rate:
+#     enough to price a shuffle step, too little to buy an early scrappy hop.
+#   - Steadier PPO for polishing a found skill: a quarter of the entropy bonus
+#     (the std regrowth) and half the adaptive-LR KL target.
+#   - Save every 50 iters: v2's best window fell between 250-iter checkpoints.
+ONCE_PLANTED_WEIGHT = 1.0
+ONCE_ENTROPY_COEF = 0.0025
+ONCE_DESIRED_KL = 0.005
+ONCE_SAVE_INTERVAL = 50
 
 # ── BunnyHop: perpetual forward bunny hop (make_microduck_hop_env_cfg(perpetual=True)) ─
 # Run 6's continuous hop, published as chelleboyer/microduck-bunny-hop, FALLS:
@@ -1090,6 +1105,11 @@ def make_microduck_hop_env_cfg(
         # was paid (mdp._hop_before_first_landing).
         for name in ONCE_FIRST_FLIGHT_ONLY_TERMS:
             cfg.rewards[name].params["first_flight_only"] = True
+        cfg.rewards["hop_planted"] = RewardTermCfg(
+            func=microduck_mdp.hop_planted_after_landing,
+            weight=ONCE_PLANTED_WEIGHT,
+            params={"min_air_time": HOP_MIN_AIR_TIME},
+        )
         cfg.metrics["extra_flight_rate"] = MetricsTermCfg(
             func=microduck_mdp.hop_metric_extra_flight,
             params={"min_air_time": HOP_MIN_AIR_TIME},
@@ -1143,21 +1163,21 @@ def _hop_rl_cfg(landing: str = "both", once: bool = False,
             value_loss_coef=1.0,
             use_clipped_value_loss=True,
             clip_param=0.2,
-            entropy_coef=0.01,
+            entropy_coef=ONCE_ENTROPY_COEF if once else 0.01,
             num_learning_epochs=5,
             num_mini_batches=4,
             learning_rate=1.0e-3,
             schedule="adaptive",
             gamma=0.99,
             lam=0.95,
-            desired_kl=0.01,
+            desired_kl=ONCE_DESIRED_KL if once else 0.01,
             max_grad_norm=1.0,
             symmetry_cfg=SYMMETRY_CFG if ENABLE_SYMMETRY and landing == "both" else None,
         ),
         wandb_project="mjlab_microduck",
         experiment_name=f"microduck_hop{suffix}",
         run_name=f"microduck_hop{suffix}",
-        save_interval=250,
+        save_interval=ONCE_SAVE_INTERVAL if once else 250,
         num_steps_per_env=24,
         max_iterations=6_000,
     )

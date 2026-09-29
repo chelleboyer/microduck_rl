@@ -31,7 +31,7 @@ def test_once_adds_the_cost_and_metric_and_nothing_else_changes_for_the_plain_ho
     assert "hop_extra_flight" not in plain.rewards and "extra_flight_rate" not in plain.metrics
     assert once.rewards["hop_extra_flight"].weight == ONCE_EXTRA_FLIGHT_WEIGHT < 0
     assert once.metrics["extra_flight_rate"].reduce == "last"
-    assert set(once.rewards) - set(plain.rewards) == {"hop_extra_flight"}
+    assert set(once.rewards) - set(plain.rewards) == {"hop_extra_flight", "hop_planted"}
 
 
 def test_once_collapses_the_source_curricula_to_their_final_stage():
@@ -140,3 +140,52 @@ def test_the_first_landing_zeroes_take_off_pay_but_not_before():
     assert float(microduck_mdp._hop_before_first_landing(env, True)[0]) == 0.0
     _step(env, airborne=True)                                          # a re-hop earns nothing
     assert float(microduck_mdp._hop_before_first_landing(env, True)[0]) == 0.0
+
+
+# ── v3: pay both feet planted after the first landing; steadier PPO ──────────
+
+from mjlab_microduck.tasks.microduck_hop_env_cfg import (  # noqa: E402
+    ONCE_DESIRED_KL,
+    ONCE_ENTROPY_COEF,
+    ONCE_PLANTED_WEIGHT,
+    ONCE_SAVE_INTERVAL,
+    MicroduckBunnyHopRlCfg,
+)
+
+
+def test_planted_reward_is_positive_and_smaller_than_the_landing_composite():
+    once = make_microduck_hop_env_cfg(once=True)
+    assert once.rewards["hop_planted"].weight == ONCE_PLANTED_WEIGHT > 0
+    assert ONCE_PLANTED_WEIGHT < once.rewards["hop_landing_composite"].weight
+    assert "hop_planted" not in make_microduck_hop_env_cfg(perpetual=True).rewards
+
+
+def test_once_ppo_is_steadier_and_saves_often_and_the_others_are_unchanged():
+    a = MicroduckHopOnceRlCfg.algorithm
+    assert (a.entropy_coef, a.desired_kl) == (ONCE_ENTROPY_COEF, ONCE_DESIRED_KL)
+    assert ONCE_ENTROPY_COEF < 0.01 and ONCE_DESIRED_KL < 0.01
+    assert MicroduckHopOnceRlCfg.save_interval == ONCE_SAVE_INTERVAL < 250
+    for other in (MicroduckHopRlCfg, MicroduckBunnyHopRlCfg):
+        assert (other.algorithm.entropy_coef, other.algorithm.desired_kl) == (0.01, 0.01)
+        assert other.save_interval == 250
+
+
+def _planted(env) -> float:
+    return float(microduck_mdp.hop_planted_after_landing(env, HOP_MIN_AIR_TIME)[0])
+
+
+def test_planted_pays_only_after_the_first_landing_with_both_feet_and_nothing_else():
+    env = _Env()
+    _step(env, airborne=False, gate_open=False)
+    assert _planted(env) == 0.0                                   # standing before the hop: nothing
+    _step(env, airborne=True)
+    assert _planted(env) == 0.0                                   # in the air
+    _step(env, airborne=False)
+    assert _planted(env) == 1.0                                   # landed, both feet down
+    env.common_step_counter += 1
+    env.feet.data.found = torch.tensor([[1.0, 0.0]])
+    assert _planted(env) == 0.0                                   # one foot lifted
+    env.common_step_counter += 1
+    env.feet.data.found = torch.ones(1, 2)
+    env.nonfoot.data.found[0, 3] = 1.0
+    assert _planted(env) == 0.0                                   # propped on the jaw

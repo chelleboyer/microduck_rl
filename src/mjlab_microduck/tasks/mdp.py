@@ -8298,6 +8298,40 @@ def _hop_before_first_landing(env: ManagerBasedRlEnv, enabled: bool,
     return (~env._hop_landed_once).float()
 
 
+def hop_planted_after_landing(
+    env: ManagerBasedRlEnv,
+    min_air_time: float = 0.06,
+    feet_sensor: str = "feet_ground_contact",
+    nonfoot_sensor: str = "nonfoot_ground_contact",
+) -> torch.Tensor:
+    """Reward: 1.0 on every step after the first landing with BOTH feet down and
+    nothing else touching.
+
+    Mjlab-HopOnce v3. The v2 one-hop policy (W&B lxqqe9j1 model_3250) ends
+    standing in 100% of episodes with a median 2.8 deg tilt at landing + 0.5 s,
+    but fails AC #4 in 56% of them, mostly (50/128) because one foot is off the
+    ground at that snapshot: nothing in the stack prices a shuffle step or a
+    lifted foot after touchdown. Silent until the first landing, so it cannot be
+    collected without hopping; a non-foot contact zeroes it, so a jaw-propped
+    two-foot stance does not qualify.
+
+    Returns >= 0 -> POSITIVE weight.
+    """
+    _update_hop_landed_once(env, min_air_time)
+    if feet_sensor in env.scene.sensors:
+        found = env.scene.sensors[feet_sensor].data.found
+        found = torch.nan_to_num(found, nan=0.0).reshape(found.shape[0], -1)[:, :2]
+        both_down = found[:, 0].bool() & found[:, 1].bool()
+    else:
+        both_down = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+    if nonfoot_sensor in env.scene.sensors:
+        nf = env.scene.sensors[nonfoot_sensor].data.found
+        nf_touching = torch.nan_to_num(nf, nan=0.0).reshape(nf.shape[0], -1).any(dim=-1)
+    else:
+        nf_touching = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+    return (env._hop_landed_once & both_down & ~nf_touching).float()
+
+
 def hop_landing_contact_cost(
     env: ManagerBasedRlEnv,
     min_air_time: float = 0.06,
