@@ -102,6 +102,14 @@ State as of 2026-09-14:
     one flight, and AC #4 is 71/128 (55%, against 52/128 for 3250 in the same breakdown).
     Lifted-foot misses fell from 57 to 43. Non-foot contacts rose from 19 to 25, and the hop
     shrank (CoM rise 25.6 → 16.6 mm, launch 0.39 → 0.35 m/s).
+    **What the lifted-foot misses are** (per-step foot trace, 128 standing spawns): quick
+    balance-recovery steps, not a held foot. At landing + 0.5 s, 81 have both feet down, 36 are
+    mid-step (the foot moves ≥ 1.5 cm) and 11 are tapping in place; none is holding a foot up.
+    Lifts last about 0.1 s, travel about 2.5 cm and rise only about 1.3 mm, so they are shuffles.
+    61% of them start within 0.5 s of landing and they taper off; 124/128 end with both feet
+    down. So AC #4's both-feet snapshot counts recovery steps as failures. Without that
+    criterion, 100/128 (78%) pass. The real remaining defect is `jaw_soft` touching the ground in
+    21/128 episodes.
 - **Run 6 design: vertical first, forward second** (the plan's AC #3).
   `hop_forward_progress` was paying for the forward lean from step 0. `ENABLE_FORWARD_GATE`:
   forward weight AND the mid-air spawn's forward speed start at 0 and advance one stage
