@@ -89,6 +89,13 @@ State as of 2026-09-14:
     `hop_forward_progress` are best-so-far frontiers, so each re-hop that beats the first flight
     is PAID. **v2** (`ONCE_FIRST_FLIGHT_ONLY_TERMS`, `_hop_before_first_landing`): take-off
     terms pay only until the first landing, so a re-hop nets about −3.8/step against +2.1 for standing.
+    **v2 run** (W&B `lxqqe9j1`, continued from `model_2498` to 3497): the fix worked, then
+    relapsed. `extra_flight_rate` 0.87 → 0.47 and clean landings 0.61 → 0.84 by iter ~3200; at
+    ~3330, with no curriculum change, re-hops returned (0.95) and action std rose 0.32 → 0.45.
+    Final `model_3497` makes a median of 3 flights per episode. **`model_3250` is the one-hop
+    policy**: 57/64 episodes make exactly one flight, 100% end standing, and the median tilt at
+    landing + 0.5 s is 2.8°. AC #4 is 44% (standing) and 41% (crouch). The main miss is a foot
+    off the ground at landing + 0.5 s (50/128), then non-foot contact (19/128).
 - **Run 6 design: vertical first, forward second** (the plan's AC #3).
   `hop_forward_progress` was paying for the forward lean from step 0. `ENABLE_FORWARD_GATE`:
   forward weight AND the mid-air spawn's forward speed start at 0 and advance one stage
@@ -380,6 +387,9 @@ Never launch a long run without one.
   them, which matches training. No-display machines: `scripts/rehearse_headless.py
   --match-training-delays --episodes N` (same sim path, no viewer). Corollary for hardware: the
   real loop's latency must sit inside the trained envelope.
+  **Its seeds only pick delays:** with no spawn noise or DR, `--episodes 64` is at most 8
+  DISTINCT rollouts (act delay 3–6 × IMU delay 0/1), and identical seeds repeat them. Read its
+  rates as "k of 8 latency configs", and take statistics from the DR'd training-env evals.
 - Real deployments hot-swap ONNX policies (walk / stand / trick) with a shared
   obs contract — rehearse in `scripts/infer_policy.py` before touching the
   robot, with the correct command-slot writes (a posture flag lives in the
