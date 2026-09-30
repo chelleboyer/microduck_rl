@@ -52,7 +52,12 @@ def test_hop_reward_signs():
     assert r["hop_upright_after_landing"].weight > 0
     assert r["hop_height_after_landing"].weight > 0
     assert r["hop_unweighting"].weight > 0
-    assert r["hop_forward_progress"].weight > 0
+    # Gated behind clean landings (run 6): starts at 0, every stage >= 0, the
+    # final stage is the objective itself.
+    assert r["hop_forward_progress"].weight >= 0
+    stages = cfg.curriculum["forward_gate"].params["weight_stages"]
+    assert stages[0] == r["hop_forward_progress"].weight and stages[-1] > 0
+    assert all(w >= 0 for w in stages)
     # ordinary cost (returns >= 0), ramped from 0 by curriculum -> NEGATIVE weight
     assert r["hop_no_crawl"].weight <= 0
 
@@ -138,8 +143,14 @@ def test_hop_midair_spawn_carries_forward_momentum():
     speed, not a dead stop, or the trained recovery won't match a real
     forward hop's landing (see midair_vx_range docstring in mdp.py)."""
     cfg = make_microduck_hop_env_cfg()
-    assert cfg.events["set_hop_state"].params["midair_vx_range"] == MIDAIR_VX_RANGE
     assert MIDAIR_VX_RANGE[1] > 0.0
+    # Run 6: the momentum is still reached, but through the forward gate — the
+    # spawn starts vertical and gains the FULL range at the gate's final stage
+    # (hop_forward_gate_curriculum scales it by weight / final weight).
+    gate = cfg.curriculum["forward_gate"].params
+    assert cfg.events["set_hop_state"].params["midair_vx_range"] == (0.0, 0.0)
+    assert gate["midair_vx_range"] == MIDAIR_VX_RANGE
+    assert gate["weight_stages"][-1] > 0.0
 
 
 def test_hop_midair_spawn_ballistically_consistent_with_target_air_time():
@@ -758,6 +769,7 @@ def test_hop_new_reward_signs_follow_the_convention():
     # ordinary costs (return >= 0) -> NEGATIVE weight
     assert r["hop_airborne_tilt"].weight < 0
     assert r["hop_lateral_drift"].weight < 0
+    assert r["hop_landing_contact"].weight < 0
     # ordinary reward -> POSITIVE weight
     assert r["hop_launch_velocity"].weight > 0
     assert r["hop_launch_velocity"].params["target_velocity"] == TARGET_LAUNCH_VZ

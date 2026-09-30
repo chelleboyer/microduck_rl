@@ -9,8 +9,17 @@ motion).
 Scope note: the product direction is a forward hop, not the in-place hop the
 PRD's v1 non-goals describe (a real-time call from the project owner,
 superseding that draft) — hop_forward_progress below is the training-side
-answer. Landing on two feet stays the v1 target; one-foot landing is an
-explicitly later step, not attempted here.
+answer. Landing on two feet stays the v1 target (Mjlab-Hop-Flat-MicroDuck).
+
+One-foot landings (hopscotch, 2026-09-28): ``landing="left"`` / ``"right"``
+builds Mjlab-HopLeft / Mjlab-HopRight — the same take-off, flight and
+exploit guards, with the landing terms gated by
+mdp.hop_landing_stance_factor: they pay only after a touchdown that came down
+on exactly the named foot, while the robot is still standing on it alone. The
+pose target shrinks to the support leg (the other one is meant to be up) and
+the mirror loss is off (HopLeft's mirror IS HopRight). ``landing="both"``
+(the default) builds the two-foot task exactly as before. Whether a one-foot
+landing is holdable on this robot at all is unmeasured — a hypothesis.
 
 Course correction 2026-09-12 (mid-run-1): the first forward-hop run's
 dominant strategy at ~1300/6000 iterations was a butt-bounce — trunk hits
@@ -157,6 +166,118 @@ ENABLE_VELOCITY_PUSHES               = False  # a push mid-hop is incoherent
 ENABLE_IMU_ORIENTATION_RANDOMIZATION = True
 ENABLE_ENCODER_BIAS                  = True
 
+# Landing annuities pay nothing once any non-foot body has touched the ground
+# since liftoff (mdp._update_hop_landing_clean). Run 3 (W&B rv0u6ot4) learned
+# a dive that lands trunk- and jaw-first in 128/128 eval episodes and was paid
+# the full landing stack for standing back up afterwards.
+ENABLE_CLEAN_LANDING_GATE = True
+
+# Run 4 (W&B 8gnv2koa) showed the latch alone is too sparse: at scale 0 from
+# step 0 no landing the policy could make ever paid, PPO lost its gradient
+# after liftoff and clean_landing_rate went 0.15 -> 0.00. Run 5 adds a slope:
+#
+#   * a dirty landing keeps a fraction of the annuities, stepped down to 0 —
+#     iteration -> scale. Guessed pacing (liftoff took ~200 iters in run 3);
+#     if clean_landing_rate steps DOWN at a boundary, stretch it (AGENTS.md).
+#   * a per-step cost on non-foot ground contact after liftoff
+#     (mdp.hop_landing_contact_cost), so less contact always pays more.
+#     Sized from run 3's logged reward mass: liftoff pays ~3.3/episode
+#     (hop_air_time 1.6 + hop_forward_progress 1.65); the worst case — dive,
+#     then lie there for ~83% of the episode — costs ~0.83*|w|. |w| must stay
+#     well under 4 so that hopping always beats not hopping; -2.0 leaves ~+1.6.
+DIRTY_LANDING_SCALE_STAGES = ((0, 0.5), (300, 0.25), (600, 0.0))
+LANDING_CONTACT_COST_WEIGHT = -2.0
+
+# Vertical first, forward second (the plan's AC #3). Run 5 (W&B woqb8g63) had
+# the slope above and still landed chest-then-jaw in 32/32 eval episodes of
+# model_500: hop_forward_progress paid for the forward lean from step 0. With
+# the gate on, forward progress (and the mid-air spawn's forward speed) start
+# at ZERO and advance one stage at a time only when the EMA of clean landings
+# reaches FORWARD_GATE_CLEAN_THRESHOLD — measured progress, not the clock
+# (mdp.hop_forward_gate_curriculum). A clean vertical hop is achievable on this
+# robot: joanfox/microduck-happy-hop and the verified max-height jump do it.
+ENABLE_FORWARD_GATE = True
+FORWARD_WEIGHT_STAGES = (0.0, 1.5, 3.0, 5.0)   # last = the original fixed weight
+FORWARD_GATE_CLEAN_THRESHOLD = 0.30
+FORWARD_GATE_MIN_DWELL_ITERS = 100
+
+# ── HopOnce: one forward hop, then stand (make_microduck_hop_env_cfg(once=True)) ─
+# Run 6 (W&B 2qbd5bto) learned a CONTINUOUS bunny hop (~10 flights per 3 s
+# episode, 89% of landings feet-only) — published as the perpetual
+# chelleboyer/microduck-bunny-hop. Nothing in the hop stack says "stop after
+# one": air time and forward progress are max-so-far frontiers, so re-hopping
+# was free. HopOnce adds mdp.hop_extra_flight_cost (per airborne step after
+# the first touchdown). Weight -4.0 matches the landing composite's peak rate
+# (weight 4 x score <= 1 per second), so a second hop always costs at least
+# what standing through it would have earned.
+#
+# Meant to CONTINUE from run 6's model_1499 — `--agent.resume True` WITHOUT
+# MICRODUCK_WARM_START, so the step counter carries on from 36000 (iter 1500).
+# The shared curricula then stay where run 6 left them (com_range had already
+# reached 0.01; a warm start would have quietly eased it back to 0.003) and
+# their designed post-discovery stages — action_rate -0.2, gentle_landing,
+# torque_rate, a more standing-heavy spawn mix — switch on at 1500, which is
+# the right polish for "stick the landing". The two curricula run 6 finished
+# (forward gate, dirty-landing scale) are collapsed to their final stage here.
+ONCE_EXTRA_FLIGHT_WEIGHT = -4.0
+ONCE_FIRST_FLIGHT_ONLY_TERMS = ("hop_unweighting", "hop_launch_velocity", "hop_air_time",
+                                "hop_forward_progress")
+# v3 (continues v2 W&B lxqqe9j1 from model_3250). v2's one-hop policy peaked at
+# iter ~3200 (extra_flight_rate 0.47, clean landings 0.84), then with no
+# curriculum change slid back to re-hopping while action std rose 0.32 -> 0.45;
+# the final model_3497 makes a median of 3 flights. model_3250 ends standing
+# 100% of the time but misses AC #4 mostly on a lifted foot at landing + 0.5 s.
+#   - hop_planted_after_landing pays both feet down (and nothing else) after the
+#     first landing. +1.0 is a quarter of the landing composite's peak rate:
+#     enough to price a shuffle step, too little to buy an early scrappy hop.
+#   - Steadier PPO for polishing a found skill: a quarter of the entropy bonus
+#     (the std regrowth) and half the adaptive-LR KL target.
+#   - Save every 50 iters: v2's best window fell between 250-iter checkpoints.
+ONCE_PLANTED_WEIGHT = 1.0
+ONCE_ENTROPY_COEF = 0.0025
+ONCE_DESIRED_KL = 0.005
+ONCE_SAVE_INTERVAL = 50
+
+# ── HopOnce-JumpWarm: HopOnce v3 warm-started from the community jump ──────────
+# ThomasBurgess2000/microduck-max-height-jump model_34995 (Apache-2.0), converted by
+# scripts/convert_jump_checkpoint.py. Same 61/74-D obs terms and the same compiled
+# robot (its d424a0c "allcollisions" model is today's groundcontact model); see
+# docs/notes/jump-warmstart-step1.md. Launch with MICRODUCK_WARM_START=1 so every
+# curriculum starts at stage 0: the jump was not trained under ours, so nothing is
+# collapsed. In particular the forward gate stays live (forward weight and mid-air
+# vx start at 0 and advance on clean landings), and so does the dirty-landing slope.
+# The jump launches under HopOnce's near-zero command (89% of standing episodes
+# with its flag held at 0), so the task keeps the publishable constant-command
+# contract. Crouch and mid-air spawns are out of distribution for it (it never
+# triggered from our crouch in 123/128), so the spawn mix starts standing-heavy.
+JUMPWARM_SPAWN_MIX = {"standing_prob": 0.70, "crouch_prob": 0.15, "midair_prob": 0.15}
+
+# ── BunnyHop: perpetual forward bunny hop (make_microduck_hop_env_cfg(perpetual=True)) ─
+# Run 6's continuous hop, published as chelleboyer/microduck-bunny-hop, FALLS:
+# in the training-latency-matched rehearsal 55 of 59 distinct 10 s rollouts
+# tipped past 60 deg (scripts/rehearse_headless.py --match-training-delays,
+# return_traces). Touchdown pitch swings of +-40-60 deg built up hop over hop
+# (a porpoising the policy only just contains), and falls came both before
+# and after the 3 s training horizon. The hop task was built for ONE episodic
+# trick: 3 s episodes and no fall termination ("landing badly and
+# recovering IS part of the task"). A perpetual gait needs the locomotion
+# recipe instead:
+#   * long episodes, so the policy lives through the drift it has to damp;
+#   * a fall termination, so a fall forfeits all the annuity it would have
+#     earned — the pressure that keeps the rocking bounded (AGENTS.md: put
+#     anti-violence pressure on outcomes, never cap rotation speed);
+#   * the clean-landing latch re-armed per flight (see mdp
+#     _update_hop_landing_clean): over 10 s a per-episode latch would zero
+#     the annuities after the first brushed landing — run 4's trap;
+#   * standing spawns up to the handover height a standing policy leaves the
+#     robot at (the rehearsal starts at trunk z 0.123-0.125 and 18 of its
+#     falls were at the very first touchdown from there).
+# Continues run 6's model_1499 like HopOnce (--agent.resume, no warm-start
+# reset); the two curricula run 6 finished are collapsed.
+BUNNY_EPISODE_LENGTH_S = 10.0
+BUNNY_FALL_TILT_DEG = 60.0
+BUNNY_STANDING_Z_MAX = 0.126
+
 # ── Ranges (matched to the roulade/standup envs) ─────────────────────────────
 COM_RANDOMIZATION_RANGE             = 0.003   # ramped via curriculum
 HEAD_COM_RANDOMIZATION_RANGE        = 0.003   # ramped via curriculum
@@ -289,6 +410,9 @@ SPAWN_MIDAIR_PROB   = 0.30
 TARGET_LAUNCH_VZ = 0.60
 
 _LEG_JOINTS = [0, 1, 2, 3, 4, 9, 10, 11, 12, 13]
+# Support-leg pose targets for the one-foot landings (servo index order).
+_SUPPORT_LEG_JOINTS = {"left": [0, 1, 2, 3, 4], "right": [9, 10, 11, 12, 13]}
+HOP_LANDINGS = ("both", "left", "right")
 
 from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.envs.mdp import dr
@@ -317,8 +441,38 @@ from mjlab_microduck.tasks.microduck_velocity_env_cfg import HEAD_BODY_NAMES
 from mjlab_microduck.tasks.symmetry import PpoWithSymmetryCfg, SYMMETRY_CFG
 
 
-def make_microduck_hop_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
-    """Create Microduck hop environment configuration."""
+def _collapse_run6_curricula(cfg: ManagerBasedRlEnvCfg) -> None:
+    """Set the two curricula run 6 finished to their final stage (AGENTS.md:
+    a continued policy was trained under the source's final conditions)."""
+    cfg.curriculum.pop("forward_gate", None)
+    cfg.curriculum.pop("dirty_landing_scale", None)
+    cfg.rewards["hop_forward_progress"].weight = FORWARD_WEIGHT_STAGES[-1]
+    cfg.events["set_hop_state"].params["midair_vx_range"] = MIDAIR_VX_RANGE
+    for name in ("hop_landing_composite", "hop_upright_after_landing",
+                 "hop_height_after_landing"):
+        cfg.rewards[name].params["dirty_landing_scale"] = DIRTY_LANDING_SCALE_STAGES[-1][1]
+
+
+def make_microduck_hop_env_cfg(
+    play: bool = False,
+    landing: str = "both",
+    once: bool = False,
+    perpetual: bool = False,
+    jump_warm: bool = False,
+) -> ManagerBasedRlEnvCfg:
+    """Create Microduck hop environment configuration.
+
+    ``landing`` picks what counts as landing: "both" (the two-foot hop,
+    unchanged), or "left" / "right" (land on that foot only and hold it).
+    ``once`` builds Mjlab-HopOnce: the same hop, then stand — flying again
+    after the first landing costs (see ONCE_* constants).
+    ``perpetual`` builds Mjlab-BunnyHop: keep hopping, never fall (BUNNY_*).
+    ``jump_warm`` (with ``once``) builds Mjlab-HopOnce-JumpWarm (JUMPWARM_*).
+    """
+    assert not (once and perpetual), "HopOnce and BunnyHop are different tasks"
+    assert not jump_warm or once, "JumpWarm is a HopOnce variant"
+    assert landing in HOP_LANDINGS, landing
+    stance = None if landing == "both" else landing
 
     feet_ground_cfg = ContactSensorCfg(
         name="feet_ground_contact",
@@ -444,7 +598,8 @@ def make_microduck_hop_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     # a shuffle or walk-forward cannot farm this.
     cfg.rewards["hop_forward_progress"] = RewardTermCfg(
         func=microduck_mdp.hop_forward_progress,
-        weight=5.0,
+        # Starts at 0 behind the clean-landing gate (FORWARD_WEIGHT_STAGES).
+        weight=FORWARD_WEIGHT_STAGES[0] if ENABLE_FORWARD_GATE else FORWARD_WEIGHT_STAGES[-1],
         params={"target_distance": TARGET_FORWARD_DIST, "max_paid_rate": 1.0},
     )
 
@@ -458,7 +613,7 @@ def make_microduck_hop_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
             "height_std":    0.04,
             "upright_std":   0.40,
             "pose_std":      0.40,
-            "joint_indices": _LEG_JOINTS,
+            "joint_indices": _LEG_JOINTS if stance is None else _SUPPORT_LEG_JOINTS[stance],
             "min_air_time":  HOP_MIN_AIR_TIME,
         },
     )
@@ -472,6 +627,23 @@ def make_microduck_hop_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         weight=1.0,
         params={"target_height": STAND_Z, "std": 0.04, "min_air_time": HOP_MIN_AIR_TIME},
     )
+    for name in ("hop_landing_composite", "hop_upright_after_landing",
+                 "hop_height_after_landing"):
+        if stance is not None:
+            cfg.rewards[name].params["stance"] = stance
+        cfg.rewards[name].params["require_clean_landing"] = ENABLE_CLEAN_LANDING_GATE
+        cfg.rewards[name].params["dirty_landing_scale"] = DIRTY_LANDING_SCALE_STAGES[0][1]
+
+    # Dense clean-landing signal (see DIRTY_LANDING_SCALE_STAGES above).
+    # Ordinary cost (returns >= 0) -> NEGATIVE weight. Live from step 0: it is
+    # gated on a completed flight, so like hop_airborne_tilt it cannot tax an
+    # attempt.
+    cfg.rewards["hop_landing_contact"] = RewardTermCfg(
+        func=microduck_mdp.hop_landing_contact_cost,
+        weight=LANDING_CONTACT_COST_WEIGHT if ENABLE_CLEAN_LANDING_GATE else 0.0,
+        params={"min_air_time": HOP_MIN_AIR_TIME},
+    )
+
     cfg.rewards["hop_stand_tax"] = RewardTermCfg(
         func=microduck_mdp.hop_stand_tax,
         weight=5.0,
@@ -570,6 +742,17 @@ def make_microduck_hop_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         params={"target_height": STAND_Z, "min_air_time": HOP_MIN_AIR_TIME},
         reduce="last",
     )
+    # The acceptance-bar metric: stable_landing_rate AND no non-foot contact at
+    # any point since liftoff. stable_landing_rate alone read 0.98 on run 3
+    # while every eval episode face-planted — read THIS one for AC #4.
+    cfg.metrics["clean_landing_rate"] = MetricsTermCfg(
+        func=microduck_mdp.hop_metric_clean_landing,
+        params={"target_height": STAND_Z, "min_air_time": HOP_MIN_AIR_TIME},
+        reduce="last",
+    )
+    if stance is not None:
+        cfg.metrics["stable_landing_rate"].params["stance"] = stance
+        cfg.metrics["clean_landing_rate"].params["stance"] = stance
 
     # Always-on upright would oppose the push-off/flight phase; landing
     # uprightness is handled by the completion-gated terms above.
@@ -696,7 +879,8 @@ def make_microduck_hop_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
             "midair_z_min":      MIDAIR_Z_MIN,
             "midair_z_max":      MIDAIR_Z_MAX,
             "midair_vz_range":   MIDAIR_VZ_RANGE,
-            "midair_vx_range":   MIDAIR_VX_RANGE,
+            # Zero until the forward gate opens (hop_forward_gate_curriculum).
+            "midair_vx_range":   (0.0, 0.0) if ENABLE_FORWARD_GATE else MIDAIR_VX_RANGE,
             "joint_noise_std":   0.08,
             "gate_min_air_time": HOP_MIN_AIR_TIME,
         },
@@ -896,46 +1080,131 @@ def make_microduck_hop_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         },
     )
 
+    if ENABLE_FORWARD_GATE:
+        cfg.curriculum["forward_gate"] = CurriculumTermCfg(
+            func=microduck_mdp.hop_forward_gate_curriculum,
+            params={
+                "reward_name":     "hop_forward_progress",
+                "weight_stages":   list(FORWARD_WEIGHT_STAGES),
+                "event_name":      "set_hop_state",
+                "midair_vx_range": MIDAIR_VX_RANGE,
+                "clean_threshold": FORWARD_GATE_CLEAN_THRESHOLD,
+                "min_dwell_steps": FORWARD_GATE_MIN_DWELL_ITERS * 24,
+                "min_air_time":    HOP_MIN_AIR_TIME,
+            },
+        )
+
+    # One schedule for all three landing annuities: how much a dirty landing
+    # still earns (see DIRTY_LANDING_SCALE_STAGES).
+    if ENABLE_CLEAN_LANDING_GATE:
+        cfg.curriculum["dirty_landing_scale"] = CurriculumTermCfg(
+            func=microduck_mdp.reward_param_curriculum,
+            params={
+                "reward_names": ["hop_landing_composite", "hop_upright_after_landing",
+                                 "hop_height_after_landing"],
+                "param_stages": [
+                    {"step": it * 24, "params": {"dirty_landing_scale": scale}}
+                    for it, scale in DIRTY_LANDING_SCALE_STAGES
+                ],
+            },
+        )
+
+    if once:
+        cfg.rewards["hop_extra_flight"] = RewardTermCfg(
+            func=microduck_mdp.hop_extra_flight_cost,
+            weight=ONCE_EXTRA_FLIGHT_WEIGHT,
+            params={"min_air_time": HOP_MIN_AIR_TIME},
+        )
+        # v2: the take-off terms pay only until the first landing. v1 (W&B
+        # asfkt0rq) left them live, and its per-phase reward breakdown showed
+        # re-hops still earning hop_air_time / hop_forward_progress: they are
+        # best-so-far frontiers, so each re-hop that beat a modest first flight
+        # was paid (mdp._hop_before_first_landing).
+        for name in ONCE_FIRST_FLIGHT_ONLY_TERMS:
+            cfg.rewards[name].params["first_flight_only"] = True
+        cfg.rewards["hop_planted"] = RewardTermCfg(
+            func=microduck_mdp.hop_planted_after_landing,
+            weight=ONCE_PLANTED_WEIGHT,
+            params={"min_air_time": HOP_MIN_AIR_TIME},
+        )
+        cfg.metrics["extra_flight_rate"] = MetricsTermCfg(
+            func=microduck_mdp.hop_metric_extra_flight,
+            params={"min_air_time": HOP_MIN_AIR_TIME},
+            reduce="last",
+        )
+    if (once and not jump_warm) or perpetual:
+        _collapse_run6_curricula(cfg)
+    if jump_warm:
+        cfg.curriculum["hop_spawn_mix"].params["param_stages"][0]["params"] = dict(JUMPWARM_SPAWN_MIX)
+
+    if perpetual:
+        cfg.episode_length_s = BUNNY_EPISODE_LENGTH_S
+        cfg.commands["twist"].resampling_time_range = (BUNNY_EPISODE_LENGTH_S,
+                                                       BUNNY_EPISODE_LENGTH_S * 2)
+        cfg.terminations["fell"] = TerminationTermCfg(
+            func=mdp.bad_orientation,
+            params={"limit_angle": math.radians(BUNNY_FALL_TILT_DEG)},
+        )
+        cfg.events["set_hop_state"].params["standing_z_max"] = BUNNY_STANDING_Z_MAX
+        for name in ("hop_landing_composite", "hop_upright_after_landing",
+                     "hop_height_after_landing"):
+            cfg.rewards[name].params["rearm_on_flight"] = True
+        cfg.metrics["clean_landing_rate"].params["rearm_on_flight"] = True
+
     return cfg
 
 
 # ── RL runner config ──────────────────────────────────────────────────────────
 
-MicroduckHopRlCfg = RslRlOnPolicyRunnerCfg(
-    actor=RslRlModelCfg(
-        hidden_dims=(512, 256, 128),
-        activation="elu",
-        obs_normalization=True,  # normalizer MUST be baked into ONNX by export.py
-        distribution_cfg={
-            "class_name": "GaussianDistribution",
-            "init_std": 1.0,
-            "std_type": "scalar",
-        },
-    ),
-    critic=RslRlModelCfg(
-        hidden_dims=(512, 256, 128),
-        activation="elu",
-        obs_normalization=True,
-    ),
-    algorithm=PpoWithSymmetryCfg(
-        value_loss_coef=1.0,
-        use_clipped_value_loss=True,
-        clip_param=0.2,
-        entropy_coef=0.01,
-        num_learning_epochs=5,
-        num_mini_batches=4,
-        learning_rate=1.0e-3,
-        schedule="adaptive",
-        gamma=0.99,
-        lam=0.95,
-        desired_kl=0.01,
-        max_grad_norm=1.0,
-        symmetry_cfg=SYMMETRY_CFG if ENABLE_SYMMETRY else None,
-    ),
-    wandb_project="mjlab_microduck",
-    experiment_name="microduck_hop",
-    run_name="microduck_hop",
-    save_interval=250,
-    num_steps_per_env=24,
-    max_iterations=6_000,
-)
+def _hop_rl_cfg(landing: str = "both", once: bool = False,
+                perpetual: bool = False, jump_warm: bool = False) -> RslRlOnPolicyRunnerCfg:
+    # Mirror loss only for the sagittal two-foot hop: the one-foot landings
+    # name a side (AGENTS.md: never for an asymmetric task).
+    suffix = (("" if landing == "both" else f"_{landing}") + ("_once" if once else "")
+              + ("_bunny" if perpetual else "") + ("_jumpwarm" if jump_warm else ""))
+    return RslRlOnPolicyRunnerCfg(
+        actor=RslRlModelCfg(
+            hidden_dims=(512, 256, 128),
+            activation="elu",
+            obs_normalization=True,  # normalizer MUST be baked into ONNX by export.py
+            distribution_cfg={
+                "class_name": "GaussianDistribution",
+                "init_std": 1.0,
+                "std_type": "scalar",
+            },
+        ),
+        critic=RslRlModelCfg(
+            hidden_dims=(512, 256, 128),
+            activation="elu",
+            obs_normalization=True,
+        ),
+        algorithm=PpoWithSymmetryCfg(
+            value_loss_coef=1.0,
+            use_clipped_value_loss=True,
+            clip_param=0.2,
+            entropy_coef=ONCE_ENTROPY_COEF if once else 0.01,
+            num_learning_epochs=5,
+            num_mini_batches=4,
+            learning_rate=1.0e-3,
+            schedule="adaptive",
+            gamma=0.99,
+            lam=0.95,
+            desired_kl=ONCE_DESIRED_KL if once else 0.01,
+            max_grad_norm=1.0,
+            symmetry_cfg=SYMMETRY_CFG if ENABLE_SYMMETRY and landing == "both" else None,
+        ),
+        wandb_project="mjlab_microduck",
+        experiment_name=f"microduck_hop{suffix}",
+        run_name=f"microduck_hop{suffix}",
+        save_interval=ONCE_SAVE_INTERVAL if once else 250,
+        num_steps_per_env=24,
+        max_iterations=6_000,
+    )
+
+
+MicroduckHopRlCfg = _hop_rl_cfg("both")
+MicroduckHopLeftRlCfg = _hop_rl_cfg("left")
+MicroduckHopRightRlCfg = _hop_rl_cfg("right")
+MicroduckHopOnceRlCfg = _hop_rl_cfg("both", once=True)
+MicroduckBunnyHopRlCfg = _hop_rl_cfg("both", perpetual=True)
+MicroduckHopOnceJumpWarmRlCfg = _hop_rl_cfg("both", once=True, jump_warm=True)

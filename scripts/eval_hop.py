@@ -430,11 +430,25 @@ def _run_wave(env: ManagerBasedRlEnv, wrapped: RslRlVecEnvWrapper, policy, wave_
     return results
 
 
+def drop_spawn_mix_curriculum(env_cfg) -> None:
+    """Remove the hop tasks' ``hop_spawn_mix`` curriculum before building an eval env.
+
+    It is an ``event_param_curriculum`` that rewrites ``set_hop_state``'s
+    standing/crouch/midair probabilities on EVERY reset, and mjlab computes
+    curricula before reset events. Left in place, it silently overwrote the
+    battery's forced spawn with the step-0 mix (35% standing / 35% crouch /
+    30% mid-air), so every "standing" and "crouch" battery measured the same
+    mixed population until 2026-09-29.
+    """
+    getattr(env_cfg, "curriculum", {}).pop("hop_spawn_mix", None)
+
+
 def run_battery(task_id: str, cfg: EvalHopConfig) -> list[HopEpisodeObservation]:
     configure_torch_backends()
     device = cfg.device or ("cuda:0" if torch.cuda.is_available() else "cpu")
 
     env_cfg = load_env_cfg(task_id, play=True)
+    drop_spawn_mix_curriculum(env_cfg)
     agent_cfg = load_rl_cfg(task_id)
 
     resume_path = _resolve_checkpoint(agent_cfg, cfg)

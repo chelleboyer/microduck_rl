@@ -477,3 +477,18 @@ def test_wave_snapshots_each_env_independently(eh, wave):
 
     assert results[0].peak_air_time_s == pytest.approx(0.2, abs=1e-6)
     assert results[1].peak_air_time_s == pytest.approx(0.3, abs=1e-6)
+
+
+def test_eval_hop_drops_the_spawn_mix_curriculum_so_forced_spawns_stick(eh):
+    """hop_spawn_mix rewrites set_hop_state's probabilities on every reset
+    (curricula run before reset events), which silently turned every forced
+    standing/crouch battery into the step-0 35/35/30 mix."""
+    import inspect
+
+    from mjlab_microduck.tasks.microduck_hop_env_cfg import make_microduck_hop_env_cfg
+
+    cfg = make_microduck_hop_env_cfg(play=True, once=True)
+    assert "hop_spawn_mix" in cfg.curriculum
+    eh.drop_spawn_mix_curriculum(cfg)
+    assert "hop_spawn_mix" not in cfg.curriculum
+    assert "drop_spawn_mix_curriculum(env_cfg)" in inspect.getsource(eh.run_battery)

@@ -41,6 +41,85 @@ State as of 2026-09-14:
   attitude penalty, and a `cfg.metrics` block — are implemented (`17f5e63`). All five structural
   defects are now closed; the rest of the plan's Phase 2 (AC #3: reducing run 3 to one question)
   is still open. Suite green at 266.
+- **Run 3 (2026-09-28, W&B `chelleboyer-road-ranger/mjlab_microduck/rv0u6ot4`, 1000 iters):
+  liftoff is discoverable** — valid_takeoff_rate 1.0, 0.17 s air, 32 mm CoM rise. **But it is a
+  dive**: `scripts/eval_hop.py` on model_750 found non-foot contact (trunk_base, jaw_soft) in
+  128/128 episodes, standing AND crouch spawns, 0% AC #4 — while `stable_landing_rate` read 0.98,
+  because it only checks the final step. Cause: `_hop_completion_gate` stays open after liftoff,
+  so standing back up after a face-plant collected the full landing annuity.
+- **Run 4 (W&B `8gnv2koa`, warm start from rv0u6ot4 `model_999`): FAILED, and the lesson is
+  general.** `ENABLE_CLEAN_LANDING_GATE` zeroed the landing annuities once any non-foot body
+  touched the ground after liftoff (`_update_hop_landing_clean`; not the old sticky taint — it
+  cannot fire before a flight). But the policy never landed clean, so EVERY landing it could make
+  scored the same zero: no gradient after liftoff, entropy pushed action std 0.62 → 1.0,
+  `clean_landing_rate` went 0.15 → 0.00 by iter 40 and stayed there; liftoff itself held. An
+  all-or-nothing gate on a skill the policy does not have yet is invisible to PPO.
+  **Read `clean_landing_rate` (AC #4's criterion), not `stable_landing_rate`.**
+- **Run 5 (W&B `woqb8g63`, fresh, 1000 iters): liftoff in ~125 iters, landing still a dive.**
+  Kept the latch but gave it a slope: dirty landings keep `DIRTY_LANDING_SCALE_STAGES` of the
+  annuities (0.5 → 0.25 → 0 at iters 0/300/600, `reward_param_curriculum`) plus
+  `hop_landing_contact_cost` (per-step non-foot contact after liftoff, weight −2.0, sized so
+  hopping still beats not hopping). The slope worked as a gradient — contact cost −0.80 → −0.30,
+  action std stable, both stage boundaries clean — but plateaued from ~iter 450 and
+  `clean_landing_rate` stayed 0.00. Per-body eval of model_500: `trunk_base` down ~0.2 s after
+  liftoff, then `jaw_soft` propping the robot ~0.3 s, 32/32 episodes. The policy shortened the
+  dive; it never changed HOW it lands.
+- **Run 6 (W&B `2qbd5bto`, fresh, 1500 iters): FIRST CLEAN LANDINGS.** Liftoff in ~125 iters
+  with forward at 0; `clean_landing_rate` 0 → 0.38 by iter 229, when the gate opened. Every
+  forward stage then cost clean landings (0.48 @1.5 → 0.29 @3.0 → 0.14 just after 5.0 at
+  iter 430). That step-down is a pacing signal for the next cfg — hold a stage until clean
+  landings are stable, not just above 30%. It recovered under the full weight: final
+  `clean_landing_rate` 0.50, `stable_landing_rate` 0.93, air 0.15 s, launch 0.58 m/s.
+  **It is a continuous bunny hop, not one hop:** ~10 qualifying flights per 3 s episode
+  (model_250). `scripts/eval_hop.py` assumes a single hop — its landing+0.5 s snapshot re-arms
+  on every landing and ~90% of episodes record none — so its AC #4 rate is an artifact on this
+  policy; `clean_landing_rate` is pessimistic too, since one brushed landing out of ~10 fails
+  the episode. Single hop vs perpetual bunny hop is a product decision still open.
+- **After run 6 (2026-09-28): B = perpetual bunny hop, A = one hop then stand.**
+  - Run 6's hop, published private as `chelleboyer/microduck-bunny-hop`, FELL in the
+    delay-matched rehearsal: 59/64 rollouts × 10 s tipped past 60°. The cause was touchdown pitch
+    swings of ±40–60° growing hop over hop, with no fall termination and only 3 s episodes.
+  - **`Mjlab-BunnyHop`** (`perpetual=True`: 10 s episodes, `fell` at 60°, the landing latch
+    re-armed per flight, standing spawns up to z 0.126), continued from run 6 for 1500 iters
+    (W&B `fm49sr5f`). Training fall share went 83% → 25%. Rehearsal of `model_2998`: falls
+    **9/64**, feet-only landings **98%**, but 1.43 hops/s and 0.05 m/s. It traded forward speed
+    for stability; the fall share plateaued at ~30% from iter ~1600 to ~2700.
+  - **`Mjlab-HopOnce`** (`once=True`, W&B `asfkt0rq`) halved re-hops (~10 → ~5 per episode) but
+    did not stop them. A per-phase reward breakdown showed why: `hop_air_time` and
+    `hop_forward_progress` are best-so-far frontiers, so each re-hop that beats the first flight
+    is PAID. **v2** (`ONCE_FIRST_FLIGHT_ONLY_TERMS`, `_hop_before_first_landing`): take-off
+    terms pay only until the first landing, so a re-hop nets about −3.8/step against +2.1 for standing.
+    **v2 run** (W&B `lxqqe9j1`, continued from `model_2498` to 3497): the fix worked, then
+    relapsed. `extra_flight_rate` 0.87 → 0.47 and clean landings 0.61 → 0.84 by iter ~3200; at
+    ~3330, with no curriculum change, re-hops returned (0.95) and action std rose 0.32 → 0.45.
+    Final `model_3497` makes a median of 3 flights per episode. **`model_3250` is the one-hop
+    policy**: 57/64 episodes make exactly one flight, 100% end standing, and the median tilt at
+    landing + 0.5 s is 2.8°. AC #4 is 44% (standing) and 41% (crouch). The main miss is a foot
+    off the ground at landing + 0.5 s (50/128), then non-foot contact (19/128).
+    **v3** (W&B `ooiuyfac`, 3250 → 3549): `hop_planted_after_landing` (+1.0), entropy 0.0025,
+    desired_kl 0.005, and a save every 50 iterations. No relapse this time: action std went
+    0.33 → 0.17 and `extra_flight_rate` settled at about 0.35. `model_3549`: 57/64 episodes make
+    one flight, and AC #4 is 71/128 (55%, against 52/128 for 3250 in the same breakdown).
+    Lifted-foot misses fell from 57 to 43. Non-foot contacts rose from 19 to 25, and the hop
+    shrank (CoM rise 25.6 → 16.6 mm, launch 0.39 → 0.35 m/s).
+    **What the lifted-foot misses are** (per-step foot trace, 128 standing spawns): quick
+    balance-recovery steps, not a held foot. At landing + 0.5 s, 81 have both feet down, 36 are
+    mid-step (the foot moves ≥ 1.5 cm) and 11 are tapping in place; none is holding a foot up.
+    Lifts last about 0.1 s, travel about 2.5 cm and rise only about 1.3 mm, so they are shuffles.
+    61% of them start within 0.5 s of landing and they taper off; 124/128 end with both feet
+    down. So AC #4's both-feet snapshot counts recovery steps as failures. Without that
+    criterion, 100/128 (78%) pass. The real remaining defect is `jaw_soft` touching the ground in
+    21/128 episodes.
+- **Run 6 design: vertical first, forward second** (the plan's AC #3).
+  `hop_forward_progress` was paying for the forward lean from step 0. `ENABLE_FORWARD_GATE`:
+  forward weight AND the mid-air spawn's forward speed start at 0 and advance one stage
+  (`FORWARD_WEIGHT_STAGES` 0 → 1.5 → 3 → 5) only when an EMA of clean landings reaches
+  `FORWARD_GATE_CLEAN_THRESHOLD` (0.30), at most once per 100 iters, never backwards
+  (`hop_forward_gate_curriculum` — measured progress, not the clock). Run 5's slope is kept.
+  Watch `Curriculum/forward_gate`: stuck at 0.0 means no clean vertical landing either, which
+  points at the landing itself, not the forward objective.
+  `joanfox/microduck-happy-hop` (ONNX, vertical hop) was tested zero-shot in this env and is NOT a
+  better warm start: ~10% AC #4, 50% non-foot contact, 20% never lift, backlash model no better.
 
 **Prior art worth reading before touching the hop:** the community policy
 `ThomasBurgess2000/microduck-max-height-jump` (GitHub) trains `Mjlab-Jump-Flat-MicroDuck` on the
@@ -257,7 +336,12 @@ Never launch a long run without one.
 
 ## Training ops & reading a run
 
-- wandb project `mjlab_microduck`; logs in `logs/<experiment_name>/`; resume
+- **Every `train` records video by default** (`train_hook.default_video_on` appends
+  `--video True`; opt out with `--video False` or `MICRODUCK_NO_VIDEO=1`). mp4s land in
+  `<run>/videos/train/`, are uploaded to W&B (key `video`) by rsl_rl's own logger, and are
+  mirrored into the HF checkpoint repo by the Jobs uploader. Watch them.
+- wandb project `mjlab_microduck` under entity `chelleboyer-road-ranger` (the username
+  `chelleboyer` is refused as a run entity — pass `WANDB_ENTITY`); logs in `logs/<experiment_name>/`; resume
   with `--agent.load-checkpoint model_XXXX.pt --agent.resume True`.
 - **Warm start ≠ resume.** mjlab's runner stores `common_step_counter` in the
   checkpoint and restores it (plus the iteration) on load, so loading another
@@ -310,6 +394,16 @@ Never launch a long run without one.
   rotation speed.
 - IMU DR is zero-centered — it trains tolerance to misalignment magnitude, and
   CANNOT compensate a systematic mounting bias (that's a runtime calibration).
+- **Rehearse with training's latency, or the rehearsal lies.** `infer_policy.py` has no
+  actuator or observation delays, while training models them (BAM actuator 3–6 physics
+  substeps; `joint_vel` always 1 control step late; IMU 0–1 step). The run-6 bunny hop scored
+  1.33 hops/s and 75% clean landings without them, and 2.38 hops/s and 94% clean landings with
+  them, which matches training. No-display machines: `scripts/rehearse_headless.py
+  --match-training-delays --episodes N` (same sim path, no viewer). Corollary for hardware: the
+  real loop's latency must sit inside the trained envelope.
+  **Its seeds only pick delays:** with no spawn noise or DR, `--episodes 64` is at most 8
+  DISTINCT rollouts (act delay 3–6 × IMU delay 0/1), and identical seeds repeat them. Read its
+  rates as "k of 8 latency configs", and take statistics from the DR'd training-env evals.
 - Real deployments hot-swap ONNX policies (walk / stand / trick) with a shared
   obs contract — rehearse in `scripts/infer_policy.py` before touching the
   robot, with the correct command-slot writes (a posture flag lives in the

@@ -3603,6 +3603,97 @@ def reward_weight(
     return torch.tensor([term_cfg.weight])
 
 
+def hop_forward_gate_curriculum(
+    env: ManagerBasedRlEnv,
+    env_ids: torch.Tensor,
+    reward_name: str,
+    weight_stages: list,
+    event_name: str,
+    midair_vx_range: tuple,
+    clean_threshold: float,
+    min_dwell_steps: int,
+    min_air_time: float = 0.06,
+    alpha_per_episode: float = 1e-4,
+) -> torch.Tensor:
+    """Vertical first, forward second: advance the forward objective only on
+    measured clean landings, never on the clock.
+
+    Run 5 (W&B woqb8g63, 2026-09-28) got liftoff in ~125 iterations but never
+    one clean landing: an eval of model_500 found the chest down ~0.2 s after
+    liftoff and the jaw propping the robot for ~0.3 s in 32/32 episodes.
+    hop_forward_progress (weight 5.0 from step 0) pays for exactly the forward
+    lean that ends in that dive. This is the plan's open AC #3.
+
+    Mechanism, called by the curriculum manager BEFORE reset events (mjlab
+    ``_reset_idx``), so the finishing episodes' latches are still intact:
+
+      * an episode counts as clean when a qualifying flight happened (or a
+        mid-air spawn's pre-seeded gate) and no non-foot body touched the
+        ground from then to the episode's end — AC #4's contact clause;
+      * the clean rate is an EMA over finished episodes, weighted per
+        episode (``alpha_per_episode``; 1e-4 ≈ 10k episodes ≈ 15 iterations
+        at 4096 envs), so batch size does not change its speed;
+      * the stage advances by ONE when the EMA reaches ``clean_threshold``
+        and at least ``min_dwell_steps`` have passed since the last advance.
+        It never goes back — a dip after a stage change is a pacing signal
+        to read in wandb, not something to oscillate on.
+
+    Each stage sets ``reward_name``'s weight to ``weight_stages[stage]`` and
+    scales the mid-air spawn's forward speed by the same fraction of the final
+    weight, so the landing practice gains forward momentum only as fast as the
+    objective that requires it. Returns the current weight (for logging).
+    """
+    _hop_state(env)
+    if not hasattr(env, "_hop_fwd_stage"):
+        env._hop_fwd_stage = 0
+        env._hop_fwd_stage_step = 0
+        env._hop_clean_ema = 0.0
+    if env_ids is not None and len(env_ids) > 0:
+        ids = env_ids.to(env._hop_landing_dirty.device, dtype=torch.long)
+        clean = (env._hop_max_air_time[ids] >= min_air_time) & ~env._hop_landing_dirty[ids]
+        n = len(ids)
+        a = 1.0 - (1.0 - alpha_per_episode) ** n
+        env._hop_clean_ema += a * (float(clean.float().mean()) - env._hop_clean_ema)
+    step = int(env.common_step_counter)
+    if (env._hop_fwd_stage < len(weight_stages) - 1
+            and env._hop_clean_ema >= clean_threshold
+            and step - env._hop_fwd_stage_step >= min_dwell_steps):
+        env._hop_fwd_stage += 1
+        env._hop_fwd_stage_step = step
+    weight = float(weight_stages[env._hop_fwd_stage])
+    env.reward_manager.get_term_cfg(reward_name).weight = weight
+    frac = weight / float(weight_stages[-1]) if weight_stages[-1] else 0.0
+    env.event_manager.get_term_cfg(event_name).params["midair_vx_range"] = (
+        midair_vx_range[0] * frac, midair_vx_range[1] * frac)
+    return torch.tensor(weight)
+
+
+def reward_param_curriculum(
+    env: ManagerBasedRlEnv,
+    env_ids: torch.Tensor,
+    reward_names: list,
+    param_stages: list[dict],
+) -> torch.Tensor:
+    """Step-staged reward PARAMS: event_param_curriculum's twin for rewards.
+
+    ``param_stages`` is a list of ``{"step": int, "params": dict}``; the latest
+    stage whose step has been reached is shallow-merged into the live params of
+    EVERY term in ``reward_names`` (one schedule for terms that must move
+    together, e.g. the three hop landing annuities). Mutates the live
+    RewardManager term cfgs, not env.cfg (a deepcopy at manager init).
+    Returns the first param's value of the active stage, for logging.
+    """
+    del env_ids
+    current = param_stages[0]["params"]
+    for stage in param_stages:
+        if env.common_step_counter >= stage["step"]:
+            current = stage["params"]
+    for name in reward_names:
+        env.reward_manager.get_term_cfg(name).params.update(current)
+    first_val = next(iter(current.values()))
+    return torch.tensor(float(first_val) if isinstance(first_val, (int, float)) else 0.0)
+
+
 def com_range_curriculum(
     env: ManagerBasedRlEnv,
     env_ids: torch.Tensor,
@@ -7474,6 +7565,21 @@ def _hop_state(env: ManagerBasedRlEnv) -> tuple:
         env._hop_max_com_rise = z.clone()
         env._hop_max_foot_rise = z.clone()
         env._hop_last_metric_step = -1
+        # One-foot landing latch (hop_landing_stance_factor): whether the
+        # first touchdown after a qualifying flight came down on exactly the
+        # named feet. Only the HopLeft / HopRight tasks read it.
+        env._hop_td_latched = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+        env._hop_td_clean = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+        env._hop_last_td_step = -1
+        # Clean-landing latch (_update_hop_landing_clean): set the first time
+        # a non-foot body touches the ground after the completion gate opens.
+        env._hop_landing_dirty = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+        env._hop_last_landing_step = -1
+        # HopOnce (hop_extra_flight_cost): first touchdown after the gate
+        # opened, and whether the robot flew again after it.
+        env._hop_landed_once = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+        env._hop_extra_flight = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+        env._hop_last_once_step = -1
     return env._hop_max_air_time, env._hop_paid, env._hop_completed
 
 
@@ -7833,6 +7939,11 @@ def reset_hop_state(
     env._hop_foot_ref_set[env_ids] = False
     env._hop_ground_start[env_ids] = ~is_mid
     env._hop_max_com_rise[env_ids] = 0.0
+    env._hop_td_latched[env_ids] = False
+    env._hop_td_clean[env_ids] = False
+    env._hop_landing_dirty[env_ids] = False
+    env._hop_landed_once[env_ids] = False
+    env._hop_extra_flight[env_ids] = False
     env._hop_max_foot_rise[env_ids] = 0.0
 
 
@@ -7840,6 +7951,7 @@ def hop_unweighting_bonus(
     env: ManagerBasedRlEnv,
     sensor_name: str = "feet_ground_contact",
     force_norm: float = 8.0,
+    first_flight_only: bool = False,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
     """Dense discovery shaping: rising CoM velocity while both feet unweight.
@@ -7863,7 +7975,8 @@ def hop_unweighting_bonus(
     bonus = torch.clamp(vz, min=0.0) * unweighted
     # Clean-gated too: a butt-bounce's rising CoM velocity while its feet
     # happen to unweight must not earn the discovery-precursor bonus either.
-    return torch.where(_hop_is_clean(env), bonus, torch.zeros_like(bonus))
+    return torch.where(_hop_is_clean(env), bonus, torch.zeros_like(bonus)) * _hop_before_first_landing(
+        env, first_flight_only)
 
 
 def hop_air_time_progress(
@@ -7871,6 +7984,7 @@ def hop_air_time_progress(
     target_air_time: float = 0.15,
     max_paid_rate: float = 1.0,
     sensor_name: str = "feet_ground_contact",
+    first_flight_only: bool = False,
 ) -> torch.Tensor:
     """Pay increments of the simultaneous-air-time frontier, up to a target.
 
@@ -7886,7 +8000,7 @@ def hop_air_time_progress(
     delta = torch.clamp(new_paid - torch.clamp(paid, max=target_air_time), min=0.0)
     delta = torch.clamp(delta, max=max_paid_rate * env.step_dt)
     env._hop_paid = torch.maximum(paid, new_paid)
-    return delta / (env.step_dt * target_air_time)
+    return delta / (env.step_dt * target_air_time) * _hop_before_first_landing(env, first_flight_only)
 
 
 def _update_hop_forward_accum(env: ManagerBasedRlEnv, sensor_name: str = "feet_ground_contact") -> None:
@@ -7958,6 +8072,7 @@ def hop_forward_progress(
     target_distance: float = 0.08,
     max_paid_rate: float = 1.0,
     sensor_name: str = "feet_ground_contact",
+    first_flight_only: bool = False,
 ) -> torch.Tensor:
     """Pay increments of the airborne-forward-displacement frontier, up to a target.
 
@@ -7977,7 +8092,274 @@ def hop_forward_progress(
     delta = torch.clamp(new_paid - torch.clamp(paid, max=target_distance), min=0.0)
     delta = torch.clamp(delta, max=max_paid_rate * env.step_dt)
     env._hop_fwd_paid = torch.maximum(paid, new_paid)
-    return delta / (env.step_dt * target_distance)
+    return delta / (env.step_dt * target_distance) * _hop_before_first_landing(env, first_flight_only)
+
+
+_HOP_STANCES = ("left", "right")
+
+
+def _hop_feet_down(env: ManagerBasedRlEnv, sensor_name: str = "feet_ground_contact") -> tuple:
+    """(left, right) foot-on-terrain booleans, LEFT first per the sensor's geom order."""
+    if sensor_name not in env.scene.sensors:
+        z = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+        return z, z
+    found = env.scene.sensors[sensor_name].data.found
+    found = torch.nan_to_num(found, nan=0.0).reshape(found.shape[0], -1)[:, :2] > 0
+    return found[:, 0], found[:, 1]
+
+
+def hop_landing_stance_factor(
+    env: ManagerBasedRlEnv,
+    stance: str,
+    min_air_time: float,
+) -> torch.Tensor:
+    """1.0 while a one-foot hopscotch landing is being held, else 0.0.
+
+    Two conditions, both required:
+      • CLEAN TOUCHDOWN (latched): the first foot contact after the completion
+        gate opens — i.e. the landing of a qualifying flight, or of a mid-air
+        spawn, whose gate is pre-seeded open — came down on the named foot
+        ONLY. Landing on the other foot or on both latches the episode at
+        zero, so shuffling onto the right stance afterwards earns nothing:
+        the landing is the test, as in hopscotch.
+      • IN STANCE NOW: the named foot is down and the other is up.
+
+    Step-guarded like the other hop accumulators so every term that reads it
+    in one control step sees the same latch.
+    """
+    assert stance in _HOP_STANCES, stance
+    _hop_state(env)
+    left, right = _hop_feet_down(env)
+    ok_now = (left & ~right) if stance == "left" else (right & ~left)
+    step = int(env.common_step_counter)
+    if step != env._hop_last_td_step:
+        gate_open = _hop_completion_gate(env, min_air_time) > 0.0
+        touchdown = gate_open & ~env._hop_td_latched & (left | right)
+        env._hop_td_clean = torch.where(touchdown, ok_now, env._hop_td_clean)
+        env._hop_td_latched = env._hop_td_latched | touchdown
+        env._hop_last_td_step = step
+    return (env._hop_td_clean & ok_now).float()
+
+
+def _hop_stance(env: ManagerBasedRlEnv, stance: Optional[str], min_air_time: float):
+    """Multiplier for the landing terms: 1 for the two-foot task (stance None)."""
+    if stance is None:
+        return 1.0
+    return hop_landing_stance_factor(env, stance, min_air_time)
+
+
+def _update_hop_landing_clean(
+    env: ManagerBasedRlEnv,
+    min_air_time: float,
+    sensor_name: str = "nonfoot_ground_contact",
+    rearm_on_flight: bool = False,
+) -> None:
+    """Latch the episode DIRTY on any non-foot ground contact after liftoff.
+
+    Closes the dive-and-face-plant found in run 3 (2026-09-28, W&B rv0u6ot4):
+    the policy took off cleanly (0.17 s of feet-only flight, so the clean-time
+    clock paid the air time in full), landed trunk-first and jaw-first in
+    128/128 eval episodes, stood back up, and then collected the whole landing
+    annuity anyway — _hop_completion_gate stays open for the rest of the
+    episode, and nothing downstream of it looked at HOW the robot came down.
+    stable_landing_rate read 0.98 because it only checks the final step.
+
+    This is AC #4's own "no non-foot body touched the ground" clause,
+    applied from the moment the gate opens: the flight, the touchdown, and
+    everything after it. It is NOT the sticky ground taint removed on
+    2026-09-13 (see _update_hop_clean_time), which latched BEFORE any hop,
+    zeroed every positive term including air time, and made "do nothing" the
+    argmax. This one:
+
+      * cannot fire before a qualifying flight (or a mid-air spawn's
+        pre-seeded gate), so it never taxes an attempt;
+      * zeroes only the landing annuities — air time, launch velocity and
+        forward progress are paid at liftoff and are untouched, so a hop
+        that face-plants still beats not hopping, and a clean hop strictly
+        beats a dirty one;
+      * pays nothing for standing back up after a dirty landing, which is
+        the point: recovery was being paid as if it were the landing.
+
+    Step-guarded like the other hop latches.
+    """
+    _hop_state(env)
+    step = int(env.common_step_counter)
+    if step == env._hop_last_landing_step:
+        return
+    env._hop_last_landing_step = step
+    if sensor_name not in env.scene.sensors:
+        return
+    found = env.scene.sensors[sensor_name].data.found
+    touching = torch.nan_to_num(found, nan=0.0).reshape(found.shape[0], -1).any(dim=-1)
+    gate_open = _hop_completion_gate(env, min_air_time) > 0.0
+    if rearm_on_flight:
+        # Perpetual hopping (Mjlab-BunnyHop): judge each landing on its own.
+        # A new whole-robot flight clears the latch, so a dirty landing costs
+        # the annuities only until the next liftoff instead of for the rest
+        # of a long episode — per-episode latching over 10 s would recreate
+        # run 4's no-gradient trap after the first brushed landing.
+        env._hop_landing_dirty = env._hop_landing_dirty & ~_hop_airborne_now(env)
+    env._hop_landing_dirty = env._hop_landing_dirty | (gate_open & touching)
+
+
+def _hop_clean_landing(
+    env: ManagerBasedRlEnv, require: bool, min_air_time: float, dirty_scale: float = 0.0,
+    rearm_on_flight: bool = False,
+):
+    """Multiplier for the landing terms: ``dirty_scale`` once the landing latched dirty.
+
+    1.0 (a plain float, as _hop_stance returns) when not required, so the
+    terms are bit-identical to before for any cfg that leaves it off.
+
+    ``dirty_scale`` exists because 0.0 from step 0 failed (run 4, W&B
+    8gnv2koa, 2026-09-28): the policy never produced a clean landing, so
+    every landing it could make scored the same zero, PPO had no gradient
+    after liftoff, entropy pushed action std 0.62 -> 1.0 and
+    clean_landing_rate went 0.15 -> 0.00 in 40 iterations and stayed there.
+    Keep partial pay for a dirty landing (so "land, then stand" still beats
+    "land, then lie there") and step it toward 0 by curriculum.
+    """
+    if not require:
+        return 1.0
+    _update_hop_landing_clean(env, min_air_time, rearm_on_flight=rearm_on_flight)
+    return torch.where(
+        env._hop_landing_dirty,
+        torch.full_like(env._hop_clean_time, float(dirty_scale)),
+        torch.ones_like(env._hop_clean_time),
+    )
+
+
+def _update_hop_landed_once(env: ManagerBasedRlEnv, min_air_time: float) -> None:
+    """Latch the first touchdown after a qualifying flight; flag any flight after it.
+
+    Step-guarded. ``_hop_landed_once`` sets on the first step the robot is not
+    fully airborne once the completion gate is open (after a real flight, or
+    at the touchdown a mid-air spawn was spawned into). ``_hop_extra_flight``
+    then records any later step with the whole robot off the ground.
+    """
+    _hop_state(env)
+    step = int(env.common_step_counter)
+    if step == env._hop_last_once_step:
+        return
+    env._hop_last_once_step = step
+    airborne = _hop_airborne_now(env)
+    extra = env._hop_landed_once & airborne
+    env._hop_extra_flight = env._hop_extra_flight | extra
+    gate_open = _hop_completion_gate(env, min_air_time) > 0.0
+    env._hop_landed_once = env._hop_landed_once | (gate_open & ~airborne)
+
+
+def hop_extra_flight_cost(env: ManagerBasedRlEnv, min_air_time: float = 0.06) -> torch.Tensor:
+    """Cost: 1.0 on every step the robot is airborne AFTER its first landing.
+
+    Mjlab-HopOnce: one forward hop, then stand. Run 6 (W&B 2qbd5bto) learned
+    a continuous bunny hop (~10 flights per 3 s episode) because nothing in
+    the two-foot hop's stack says "stop after one" — air time and forward
+    progress are max-so-far frontiers, so re-hopping cost nothing. Silent
+    until the first touchdown, so it cannot tax the hop itself; dense (per
+    airborne step), so a shorter re-hop is cheaper than a longer one and the
+    gradient points at "stay down" rather than at a cliff. Also charges the
+    brief whole-robot bounces of a hard landing, which is the right pressure
+    for a landing that should stick.
+
+    Ordinary cost (returns >= 0) -> NEGATIVE weight.
+    """
+    _update_hop_accum(env)
+    _update_hop_landed_once(env, min_air_time)
+    return (env._hop_landed_once & _hop_airborne_now(env)).float()
+
+
+def hop_metric_extra_flight(env: ManagerBasedRlEnv, min_air_time: float = 0.06) -> torch.Tensor:
+    """1.0 where the robot flew again after its first landing. reduce="last"."""
+    _update_hop_accum(env)
+    _update_hop_landed_once(env, min_air_time)
+    return env._hop_extra_flight.float()
+
+
+def _hop_before_first_landing(env: ManagerBasedRlEnv, enabled: bool,
+                              min_air_time: float = 0.06):
+    """Multiplier for the take-off terms in Mjlab-HopOnce: 0 after the first landing.
+
+    HopOnce v1 (W&B asfkt0rq) halved re-hops but never stopped them. A
+    per-phase reward breakdown of its final checkpoint found why: during a
+    re-hop the policy still earned hop_air_time (~1.2/step) and
+    hop_forward_progress (~2.2/step). Those are best-so-far frontiers, so a
+    modest first hop followed by re-hops that beat it collects the
+    difference, and the extra-flight cost only partly offset it. With this
+    gate the first flight is the only one that can earn take-off pay. Only
+    the PAYOUT is zeroed: the frontiers keep updating, because the
+    completion gate reads the air-time frontier.
+
+    1.0 (a plain float) when disabled, so other tasks are bit-identical.
+    """
+    if not enabled:
+        return 1.0
+    _update_hop_landed_once(env, min_air_time)
+    return (~env._hop_landed_once).float()
+
+
+def hop_planted_after_landing(
+    env: ManagerBasedRlEnv,
+    min_air_time: float = 0.06,
+    feet_sensor: str = "feet_ground_contact",
+    nonfoot_sensor: str = "nonfoot_ground_contact",
+) -> torch.Tensor:
+    """Reward: 1.0 on every step after the first landing with BOTH feet down and
+    nothing else touching.
+
+    Mjlab-HopOnce v3. The v2 one-hop policy (W&B lxqqe9j1 model_3250) ends
+    standing in 100% of episodes with a median 2.8 deg tilt at landing + 0.5 s,
+    but fails AC #4 in 56% of them, mostly (50/128) because one foot is off the
+    ground at that snapshot: nothing in the stack prices a shuffle step or a
+    lifted foot after touchdown. Silent until the first landing, so it cannot be
+    collected without hopping; a non-foot contact zeroes it, so a jaw-propped
+    two-foot stance does not qualify.
+
+    Returns >= 0 -> POSITIVE weight.
+    """
+    _update_hop_landed_once(env, min_air_time)
+    if feet_sensor in env.scene.sensors:
+        found = env.scene.sensors[feet_sensor].data.found
+        found = torch.nan_to_num(found, nan=0.0).reshape(found.shape[0], -1)[:, :2]
+        both_down = found[:, 0].bool() & found[:, 1].bool()
+    else:
+        both_down = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+    if nonfoot_sensor in env.scene.sensors:
+        nf = env.scene.sensors[nonfoot_sensor].data.found
+        nf_touching = torch.nan_to_num(nf, nan=0.0).reshape(nf.shape[0], -1).any(dim=-1)
+    else:
+        nf_touching = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+    return (env._hop_landed_once & both_down & ~nf_touching).float()
+
+
+def hop_landing_contact_cost(
+    env: ManagerBasedRlEnv,
+    min_air_time: float = 0.06,
+    sensor_name: str = "nonfoot_ground_contact",
+) -> torch.Tensor:
+    """Cost: 1.0 on every step a non-foot body touches the ground after liftoff.
+
+    The DENSE half of the clean-landing signal. The latch alone is binary per
+    episode, so a policy that never lands clean sees no difference between
+    brushing the jaw for one step and lying on its chest for two seconds —
+    run 4's failure. Charging per step of contact ranks those: less contact
+    is always better, which is a slope from the dive toward a clean landing.
+
+    Gated on the completion gate, like the latch: a pre-hop fall costs
+    nothing here (the clean-time clock handles those), so this cannot tax an
+    attempt or make "do nothing" the argmax. Size the weight so that the
+    worst case (dive, then lie there for the rest of the episode) still
+    costs less than a liftoff earns — hopping must beat not hopping.
+
+    Ordinary cost (returns >= 0) -> NEGATIVE weight.
+    """
+    _update_hop_accum(env)
+    if sensor_name not in env.scene.sensors:
+        return torch.zeros(env.num_envs, device=env.device)
+    found = env.scene.sensors[sensor_name].data.found
+    touching = torch.nan_to_num(found, nan=0.0).reshape(found.shape[0], -1).any(dim=-1)
+    gate_open = _hop_completion_gate(env, min_air_time) > 0.0
+    return (gate_open & touching).float()
 
 
 def hop_landing_composite(
@@ -7989,13 +8371,22 @@ def hop_landing_composite(
     joint_indices: list,
     min_air_time: float = 0.06,
     target_overrides: Optional[dict] = None,
+    stance: Optional[str] = None,
+    require_clean_landing: bool = False,
+    dirty_landing_scale: float = 0.0,
+    rearm_on_flight: bool = False,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
     """standing_composite_score × completion gate — the landing/recovery annuity.
 
     Mirrors roulade_landing_composite exactly, gated on having hopped
     (simultaneous air time past min_air_time) instead of rotation past a
-    threshold.
+    threshold. ``stance`` ("left" / "right", the one-foot hopscotch landings)
+    additionally multiplies by hop_landing_stance_factor; None (the two-foot
+    Mjlab-Hop task) leaves this term exactly as it was.
+    ``require_clean_landing`` additionally scales it by ``dirty_landing_scale``
+    once any non-foot body has touched the ground since liftoff
+    (_update_hop_landing_clean / _hop_clean_landing).
     """
     asset: Entity = env.scene[asset_cfg.name]
     _update_hop_accum(env)
@@ -8009,12 +8400,18 @@ def hop_landing_composite(
         target_overrides=target_overrides,
         asset_cfg=asset_cfg,
     )
-    return score * _hop_completion_gate(env, min_air_time)
+    return (score * _hop_completion_gate(env, min_air_time) * _hop_stance(env, stance, min_air_time)
+            * _hop_clean_landing(env, require_clean_landing, min_air_time, dirty_landing_scale,
+                               rearm_on_flight))
 
 
 def hop_upright_after_landing(
     env: ManagerBasedRlEnv,
     min_air_time: float = 0.06,
+    stance: Optional[str] = None,
+    require_clean_landing: bool = False,
+    dirty_landing_scale: float = 0.0,
+    rearm_on_flight: bool = False,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
     """Linear cos(tilt) × completion gate — bootstrap pull toward vertical."""
@@ -8022,7 +8419,10 @@ def hop_upright_after_landing(
     _update_hop_accum(env)
     quat = asset.data.root_link_quat_w
     upright = 1.0 - 2.0 * (quat[:, 1].pow(2) + quat[:, 2].pow(2))
-    return torch.clamp(upright, min=0.0) * _hop_completion_gate(env, min_air_time)
+    return (torch.clamp(upright, min=0.0) * _hop_completion_gate(env, min_air_time)
+            * _hop_stance(env, stance, min_air_time)
+            * _hop_clean_landing(env, require_clean_landing, min_air_time, dirty_landing_scale,
+                               rearm_on_flight))
 
 
 def hop_height_after_landing(
@@ -8030,6 +8430,10 @@ def hop_height_after_landing(
     target_height: float,
     std: float = 0.04,
     min_air_time: float = 0.06,
+    stance: Optional[str] = None,
+    require_clean_landing: bool = False,
+    dirty_landing_scale: float = 0.0,
+    rearm_on_flight: bool = False,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
     """Broad height Gaussian × completion gate — pull up to standing height."""
@@ -8039,7 +8443,9 @@ def hop_height_after_landing(
         asset.data.root_link_pos_w[:, 2] - env.scene.terrain.env_origins[:, 2], nan=0.0
     )
     g = torch.exp(-((z - target_height) / std) ** 2)
-    return g * _hop_completion_gate(env, min_air_time)
+    return (g * _hop_completion_gate(env, min_air_time) * _hop_stance(env, stance, min_air_time)
+            * _hop_clean_landing(env, require_clean_landing, min_air_time, dirty_landing_scale,
+                               rearm_on_flight))
 
 
 def hop_stand_tax(
@@ -8146,6 +8552,7 @@ def hop_launch_velocity_progress(
     target_velocity: float = 0.60,
     max_paid_rate: float = 1.0,
     sensor_name: str = "feet_ground_contact",
+    first_flight_only: bool = False,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
     """Pay increments of the max upward velocity reached WHILE STILL LOADED.
@@ -8199,7 +8606,7 @@ def hop_launch_velocity_progress(
     delta = torch.clamp(new_paid - torch.clamp(paid, max=target_velocity), min=0.0)
     delta = torch.clamp(delta, max=max_paid_rate * env.step_dt)
     env._hop_launch_vz_paid = torch.maximum(paid, new_paid)
-    return delta / (env.step_dt * target_velocity)
+    return delta / (env.step_dt * target_velocity) * _hop_before_first_landing(env, first_flight_only)
 
 
 def hop_airborne_tilt_penalty(
@@ -8418,9 +8825,13 @@ def hop_metric_stable_landing(
     min_air_time: float = 0.06,
     height_tol: float = 0.02,
     upright_min: float = 0.9,
+    stance: Optional[str] = None,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
     """1.0 where the robot took off AND is now standing cleanly. reduce="last".
+
+    With ``stance`` set (the one-foot landings), "standing cleanly" also means
+    the touchdown was clean and the robot is standing on exactly that foot.
 
     All four conditions at once, evaluated on the step it is read: a
     qualifying flight happened this episode, the trunk is within height_tol
@@ -8449,4 +8860,36 @@ def hop_metric_stable_landing(
         & (upright >= upright_min)
         & ~nf_touching
     )
-    return ok.float()
+    return ok.float() * _hop_stance(env, stance, min_air_time)
+
+
+def hop_metric_clean_landing(
+    env: ManagerBasedRlEnv,
+    target_height: float,
+    min_air_time: float = 0.06,
+    height_tol: float = 0.02,
+    upright_min: float = 0.9,
+    stance: Optional[str] = None,
+    rearm_on_flight: bool = False,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """stable_landing AND no non-foot ground contact at ANY point since liftoff.
+
+    With ``rearm_on_flight`` (Mjlab-BunnyHop) "since liftoff" means since the
+    LATEST liftoff, so it scores the episode's final landing.
+
+    hop_metric_stable_landing checks non-foot contact only on the step it is
+    read (reduce="last": the final one), so a robot that face-planted and
+    then stood back up scores 1.0 there — run 3 logged 0.98 while an eval of
+    the same policy found non-foot contact in 128/128 episodes. This reads
+    the clean-landing latch as well, which is AC #4's criterion. Kept as a
+    separate metric so stable_landing_rate stays comparable across runs.
+    As with valid_takeoff_rate, mid-air spawns count: their gate is
+    pre-seeded, so they are judged on the touchdown they were spawned into.
+    """
+    ok = hop_metric_stable_landing(
+        env, target_height=target_height, min_air_time=min_air_time,
+        height_tol=height_tol, upright_min=upright_min, stance=stance, asset_cfg=asset_cfg,
+    )
+    _update_hop_landing_clean(env, min_air_time, rearm_on_flight=rearm_on_flight)
+    return ok * (~env._hop_landing_dirty).float()

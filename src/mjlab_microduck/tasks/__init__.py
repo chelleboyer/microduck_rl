@@ -1,4 +1,8 @@
-from mjlab_microduck.train_hook import maybe_submit_to_hf_jobs
+from mjlab_microduck.train_hook import default_video_on, maybe_submit_to_hf_jobs
+
+# Every `train` records videos unless told not to (train_hook.default_video_on).
+# Must run before the submit below so the flag is forwarded to HF Jobs.
+default_video_on()
 
 # `train <task> ... --hf-jobs` submits to HF Jobs and exits here, before any
 # of the cfg imports below: this module is what mjlab's plugin loader pulls
@@ -78,6 +82,11 @@ from .microduck_roulade_env_cfg import (
 from .microduck_hop_env_cfg import (
     make_microduck_hop_env_cfg,
     MicroduckHopRlCfg,
+    MicroduckHopLeftRlCfg,
+    MicroduckHopRightRlCfg,
+    MicroduckHopOnceRlCfg,
+    MicroduckHopOnceJumpWarmRlCfg,
+    MicroduckBunnyHopRlCfg,
 )
 from .backlash import make_backlash_variant
 
@@ -246,6 +255,48 @@ register_mjlab_task(
     rl_cfg=MicroduckHopRlCfg,
     runner_cls=MicroduckOnPolicyRunner,
 )
+
+# HopOnce — the same two-foot forward hop, then stand still: flying again
+# after the first landing costs (make_microduck_hop_env_cfg(once=True)).
+register_mjlab_task(
+    task_id="Mjlab-HopOnce-Flat-MicroDuck",
+    env_cfg=make_microduck_hop_env_cfg(once=True),
+    play_env_cfg=make_microduck_hop_env_cfg(play=True, once=True),
+    rl_cfg=MicroduckHopOnceRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
+# HopOnce-JumpWarm — HopOnce v3 warm-started from the community jump
+# (ThomasBurgess2000/microduck-max-height-jump); forward gate live, standing-heavy
+# spawns (make_microduck_hop_env_cfg(once=True, jump_warm=True)).
+register_mjlab_task(
+    task_id="Mjlab-HopOnce-JumpWarm-Flat-MicroDuck",
+    env_cfg=make_microduck_hop_env_cfg(once=True, jump_warm=True),
+    play_env_cfg=make_microduck_hop_env_cfg(play=True, once=True, jump_warm=True),
+    rl_cfg=MicroduckHopOnceJumpWarmRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
+# BunnyHop — the perpetual forward bunny hop: 10 s episodes, a fall
+# termination, landing quality judged per hop (make_microduck_hop_env_cfg(perpetual=True)).
+register_mjlab_task(
+    task_id="Mjlab-BunnyHop-Flat-MicroDuck",
+    env_cfg=make_microduck_hop_env_cfg(perpetual=True),
+    play_env_cfg=make_microduck_hop_env_cfg(play=True, perpetual=True),
+    rl_cfg=MicroduckBunnyHopRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
+# Hopscotch one-foot landings — the same hop, landing on the named foot only
+# and holding it (microduck_hop_env_cfg.py, landing="left"/"right").
+for _landing, _hop_rl in (("Left", MicroduckHopLeftRlCfg), ("Right", MicroduckHopRightRlCfg)):
+    register_mjlab_task(
+        task_id=f"Mjlab-Hop{_landing}-Flat-MicroDuck",
+        env_cfg=make_microduck_hop_env_cfg(landing=_landing.lower()),
+        play_env_cfg=make_microduck_hop_env_cfg(play=True, landing=_landing.lower()),
+        rl_cfg=_hop_rl,
+        runner_cls=MicroduckOnPolicyRunner,
+    )
 
 # Backlash variants — ±1° serial gear play per servo + encoder-through-backlash
 # actuator feedback and joint obs (see tasks/backlash.py). Each family keeps its

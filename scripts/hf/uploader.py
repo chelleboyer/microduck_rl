@@ -1,6 +1,6 @@
 """Checkpoint uploader run inside an HF Job.
 
-Watches `logs/rsl_rl/**/model_*.pt` and uploads new/updated files to the
+Watches `logs/rsl_rl/**/model_*.pt` (plus params and training videos) and uploads new/updated files to the
 target HF Model repo. Designed to be `nohup uv run`-launched from the job
 bootstrap, with auth coming from the HF_TOKEN secret injected by `hf jobs run`.
 """
@@ -38,6 +38,8 @@ def main() -> int:
             # also pick up the dumped configs once
             files += [p for p in root.glob("**/params/*.yaml")]
             files += [p for p in root.glob("**/params/*.json")]
+            # training videos (`train` records them by default, train_hook.py)
+            files += [p for p in root.glob("**/videos/**/*.mp4")]
 
             to_upload: list[CommitOperationAdd] = []
             for f in files:
